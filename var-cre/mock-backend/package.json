@@ -1,0 +1,11 @@
+{
+  "name": "var-mock-backend",
+  "version": "1.0.0",
+  "description": "Mock backend for AI-Powered Autonomous Compute Provisioning",
+  "main": "server.ts",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun --watch run server.ts"
+  },
+  "dependencies": {}
+}

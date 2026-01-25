@@ -1,0 +1,31 @@
+# CRE Workflow Settings - AI-Powered Autonomous Compute Provisioning
+#
+# This workflow demonstrates an AI agent that:
+# 1. Analyzes tasks using an LLM to determine compute requirements
+# 2. Fetches quotes from decentralized compute providers (Akash-style)
+# 3. Uses AI to select the optimal provider
+# 4. Executes payment via x402 stablecoin protocol
+# 5. Provisions compute on decentralized infrastructure
+# 6. Records verifiable attestation on-chain
+#
+# Hackathon Requirements Met:
+# - Integrates blockchain (Base/Ethereum) with external API (compute providers)
+# - Integrates AI/LLM for decision-making and automation
+# - Demonstrates verifiable execution via CRE consensus
+# - AI-assisted workflow with autonomous agent capabilities
+
+staging-settings:
+  user-workflow:
+    workflow-name: "ai-compute-provision-staging"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.staging.json"
+    secrets-path: ""
+
+production-settings:
+  user-workflow:
+    workflow-name: "ai-compute-provision-production"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.production.json"
+    secrets-path: ""

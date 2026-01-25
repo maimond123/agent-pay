@@ -1,0 +1,11 @@
+{
+  "schedule": "*/30 * * * * *",
+  "provisionServiceUrl": "http://localhost:3001/services",
+  "paymentGatewayUrl": "http://localhost:3001/x402/pay",
+  "agentId": "demo-agent-001",
+  "serviceType": "vps",
+  "maxBudget": "10000000",
+  "chainName": "ethereum-testnet-sepolia-base-1",
+  "attestationRegistry": "0x0000000000000000000000000000000000000001",
+  "gasLimit": 500000
+}

@@ -1,0 +1,4 @@
+{
+  "schedule": "*/30 * * * * *",
+  "testUrl": "http://localhost:3001/health"
+}
