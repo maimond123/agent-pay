@@ -19,6 +19,17 @@ export const ComputeQuoteRequestSchema = z.object({
 
 export const ComputeProvisionRequestSchema = z.object({
   quoteId: z.string(),
+  // CRE workflow compatibility fields
+  paymentTx: z.string().optional(),
+  image: z.string().optional(),
+  provider: z.string().optional(),
+  specs: z.object({
+    cpu: z.number().optional(),
+    ram: z.string().optional(),
+    memory: z.string().optional(),
+    storage: z.string().optional(),
+  }).optional(),
+  // Standard fields
   env: z.record(z.string()).optional(),
   command: z.array(z.string()).optional(),
   ports: z.array(z.object({

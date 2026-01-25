@@ -19,18 +19,19 @@ async function main() {
 ║  This gateway enables AI agents to provision compute on Akash Network        ║
 ║  using USDC payments via the x402 protocol.                                  ║
 ║                                                                              ║
-║  API Endpoints:                                                              ║
+║  Compute Endpoints:                                                          ║
 ║  • POST /compute/quote        - Get pricing for compute specs                ║
-║  • POST /compute/provision    - Deploy compute (requires x402 payment)       ║
+║  • POST /compute/quotes       - Get multi-provider quotes (CRE compatible)   ║
+║  • POST /compute/provision    - Deploy compute (requires payment)            ║
 ║  • GET  /compute/:id/status   - Get deployment status                        ║
-║  • GET  /compute              - List all deployments                         ║
-║  • GET  /compute/stats        - Gateway statistics                           ║
 ║                                                                              ║
-║  Payment Flow:                                                               ║
-║  1. Request a quote with desired specs                                       ║
-║  2. Send USDC to the recipient address                                       ║
-║  3. Call provision with quote ID and payment tx hash                         ║
-║  4. Poll status endpoint until deployment is running                         ║
+║  LLM Endpoints (for CRE workflow):                                           ║
+║  • POST /llm/analyze          - Analyze task, recommend compute specs        ║
+║  • POST /llm/select-provider  - Select best provider from quotes             ║
+║                                                                              ║
+║  Payment Endpoints (x402):                                                   ║
+║  • POST /x402/pay             - Process USDC payment                         ║
+║  • POST /x402/verify          - Verify payment transaction                   ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 `);

@@ -4,17 +4,17 @@ import { logger } from '../server/logger.js';
 // AKASH PRICING CONSTANTS
 // ============================================================================
 
-// Base pricing in uAKT per block (~6 seconds)
-// These are approximate values based on Akash network rates
-const PRICING_PER_BLOCK = {
-  cpu: 10,        // uAKT per CPU core per block
-  memory: 5,      // uAKT per MB RAM per block
-  storage: 1,     // uAKT per MB storage per block
-  gpuNvidia: 500, // uAKT per GPU per block (varies by model)
+// Base pricing per hour in USD cents (realistic Akash-like pricing)
+// Based on typical decentralized compute marketplace rates
+const PRICING_PER_HOUR_CENTS = {
+  cpu: 0.5,       // $0.005 per CPU core per hour
+  memoryGb: 0.2,  // $0.002 per GB RAM per hour
+  storageGb: 0.05, // $0.0005 per GB storage per hour
+  gpuNvidia: 50,  // $0.50 per GPU per hour (varies by model)
 };
 
-// Blocks per hour (10 blocks/min * 60 min)
-const BLOCKS_PER_HOUR = 600;
+// For Akash cost calculation (approximate)
+const UAKT_PER_USD_CENT = 285; // ~$3.50/AKT means 1 cent = ~285 uAKT
 
 // AKT to USD exchange rate (should be fetched from oracle in production)
 let aktUsdRate = 3.50; // Default rate
@@ -55,26 +55,30 @@ export interface PricingResult {
  * Calculate deployment cost in Akash tokens and USD
  */
 export function calculatePrice(input: PricingInput): PricingResult {
-  const totalBlocks = input.hours * BLOCKS_PER_HOUR;
+  // Convert memory/storage to GB
+  const memoryGb = input.memoryMb / 1024;
+  const storageGb = input.storageMb / 1024;
 
-  // Calculate individual costs in uAKT
-  const cpuCostUakt = BigInt(Math.ceil(input.cpu * PRICING_PER_BLOCK.cpu * totalBlocks));
-  const memoryCostUakt = BigInt(Math.ceil(input.memoryMb * PRICING_PER_BLOCK.memory * totalBlocks));
-  const storageCostUakt = BigInt(Math.ceil(input.storageMb * PRICING_PER_BLOCK.storage * totalBlocks));
+  // Calculate individual costs in USD cents
+  const cpuCostCents = input.cpu * PRICING_PER_HOUR_CENTS.cpu * input.hours;
+  const memoryCostCents = memoryGb * PRICING_PER_HOUR_CENTS.memoryGb * input.hours;
+  const storageCostCents = storageGb * PRICING_PER_HOUR_CENTS.storageGb * input.hours;
 
-  let gpuCostUakt = BigInt(0);
+  let gpuCostCents = 0;
   if (input.gpu && input.gpu.count > 0) {
-    gpuCostUakt = BigInt(Math.ceil(input.gpu.count * PRICING_PER_BLOCK.gpuNvidia * totalBlocks));
+    gpuCostCents = input.gpu.count * PRICING_PER_HOUR_CENTS.gpuNvidia * input.hours;
   }
 
-  // Total Akash cost in uAKT
+  // Total cost in cents and USD
+  const totalCostCents = cpuCostCents + memoryCostCents + storageCostCents + gpuCostCents;
+  const akashCostUsd = totalCostCents / 100;
+
+  // Calculate approximate uAKT cost
+  const cpuCostUakt = BigInt(Math.ceil(cpuCostCents * UAKT_PER_USD_CENT));
+  const memoryCostUakt = BigInt(Math.ceil(memoryCostCents * UAKT_PER_USD_CENT));
+  const storageCostUakt = BigInt(Math.ceil(storageCostCents * UAKT_PER_USD_CENT));
+  const gpuCostUakt = BigInt(Math.ceil(gpuCostCents * UAKT_PER_USD_CENT));
   const akashCostUakt = cpuCostUakt + memoryCostUakt + storageCostUakt + gpuCostUakt;
-
-  // Convert to AKT (1 AKT = 1,000,000 uAKT)
-  const akashCostAkt = Number(akashCostUakt) / 1_000_000;
-
-  // Convert to USD
-  const akashCostUsd = akashCostAkt * aktUsdRate;
 
   // Apply markup
   const markupUsd = akashCostUsd * (MARKUP_PERCENTAGE / 100);

@@ -3,9 +3,9 @@
   "agentId": "var-ai-agent-001",
   "taskDescription": "Run a Python machine learning training job on the MNIST dataset using PyTorch. The job should train a CNN model for 10 epochs and save the results.",
   "maxBudgetUsdc": "5.00",
-  "llmApiUrl": "http://localhost:3002/llm",
-  "computeGatewayUrl": "http://localhost:3002/compute",
-  "paymentGatewayUrl": "http://localhost:3002/x402/pay",
+  "llmApiUrl": "http://localhost:3000/llm",
+  "computeGatewayUrl": "http://localhost:3000/compute",
+  "paymentGatewayUrl": "http://localhost:3000/x402/pay",
   "chainName": "base-sepolia",
   "attestationRegistry": "0x0000000000000000000000000000000000000001"
 }
