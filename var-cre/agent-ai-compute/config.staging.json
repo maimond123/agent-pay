@@ -7,5 +7,5 @@
   "computeGatewayUrl": "http://localhost:3000/compute",
   "paymentGatewayUrl": "http://localhost:3000/x402/pay",
   "chainName": "base-sepolia",
-  "attestationRegistry": "0x0000000000000000000000000000000000000001"
+  "attestationRegistry": "0xa7751C024FdaeF4D3c17dAEaDF3e00B79dF43C94"
 }
