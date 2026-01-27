@@ -48,7 +48,7 @@ async function main() {
   // Create and start server
   const app = createApp();
 
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     logger.info({ port }, `x402 Akash Gateway running on http://localhost:${port}`);
     console.log(`
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -58,6 +58,22 @@ async function main() {
 │  Mode: ${(process.env.AKASH_MNEMONIC ? 'Production (Akash connected)' : 'Mock (no wallet configured)').padEnd(69)}│
 └──────────────────────────────────────────────────────────────────────────────┘
 `);
+  });
+
+  server.on('error', (error: NodeJS.ErrnoException) => {
+    if (error.code === 'EADDRINUSE') {
+      logger.fatal(
+        { port, error },
+        `Port ${port} is already in use. Please stop the process using this port or set a different PORT environment variable.`
+      );
+      console.error(`\n❌ Error: Port ${port} is already in use.\n`);
+      console.error(`   To fix this, either:`);
+      console.error(`   1. Stop the process using port ${port}`);
+      console.error(`   2. Set a different PORT: PORT=3001 npm start\n`);
+    } else {
+      logger.fatal({ error }, 'Server error');
+    }
+    process.exit(1);
   });
 }
 

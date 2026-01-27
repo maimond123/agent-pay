@@ -1,0 +1,47 @@
+{
+  "name": "agent-pay",
+  "version": "0.1.0",
+  "description": "MCP server for provisioning paid developer services — starting with Akash compute",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "agent-pay": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "akash",
+    "usdc",
+    "compute",
+    "agent",
+    "x402"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maimond123/verifiable-agents.git",
+    "directory": "agent-pay"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

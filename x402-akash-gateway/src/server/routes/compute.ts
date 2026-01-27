@@ -344,6 +344,62 @@ router.get('/:deploymentId/status', async (req: Request, res: Response, next: Ne
 });
 
 // ============================================================================
+// CLOSE ENDPOINT - Stop a running deployment
+// ============================================================================
+
+router.post('/:deploymentId/close', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { deploymentId } = req.params;
+
+    const deployment = getDeployment(deploymentId);
+    if (!deployment) {
+      return res.status(404).json({
+        error: 'Deployment not found',
+      });
+    }
+
+    if (deployment.status === 'stopped') {
+      return res.json({
+        deploymentId,
+        status: 'stopped',
+        message: 'Deployment is already stopped.',
+      });
+    }
+
+    if (deployment.status === 'failed') {
+      // Just mark as stopped, nothing to close on Akash
+      updateDeploymentStatus(deploymentId, 'stopped');
+      return res.json({
+        deploymentId,
+        status: 'stopped',
+        message: 'Deployment was in failed state and has been marked as stopped.',
+      });
+    }
+
+    // If the deployment has an Akash dseq, close the on-chain deployment
+    if (deployment.akash?.dseq) {
+      try {
+        const akash = getAkashClient();
+        await akash.closeDeployment(deployment.akash.dseq);
+        logger.info({ deploymentId, dseq: deployment.akash.dseq }, 'Akash deployment closed');
+      } catch (error) {
+        logger.error({ error, deploymentId }, 'Failed to close Akash deployment, marking as stopped anyway');
+      }
+    }
+
+    updateDeploymentStatus(deploymentId, 'stopped');
+
+    return res.json({
+      deploymentId,
+      status: 'stopped',
+      message: 'Deployment has been stopped and resources released.',
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============================================================================
 // LIST ENDPOINT - List all deployments
 // ============================================================================
 

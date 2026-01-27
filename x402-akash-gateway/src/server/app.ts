@@ -73,6 +73,26 @@ export function createApp() {
     next();
   });
 
+  // API key authentication
+  const gatewayApiKey = process.env.GATEWAY_API_KEY;
+  if (gatewayApiKey) {
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      // Allow health check and root info without auth
+      if (req.path === '/health' || req.path === '/') {
+        return next();
+      }
+      const authHeader = req.headers.authorization;
+      if (!authHeader || authHeader !== `Bearer ${gatewayApiKey}`) {
+        res.status(401).json({ error: 'Unauthorized — invalid or missing API key' });
+        return;
+      }
+      next();
+    });
+    logger.info('API key authentication enabled');
+  } else {
+    logger.warn('No GATEWAY_API_KEY set — all routes are unauthenticated');
+  }
+
   // ──────────────────────────────────────────────────────────────────────────
   // X402 PAYMENT MIDDLEWARE (for provision endpoint)
   // ──────────────────────────────────────────────────────────────────────────
