@@ -19,7 +19,7 @@ const CHAINS: Record<string, typeof baseSepolia | typeof base> = {
   'base': base,
 };
 
-// ERC20 ABI (minimal for balance checking and approval verification)
+// ERC20 ABI (for balance, allowance, and transferFrom)
 const ERC20_ABI = [
   {
     name: 'balanceOf',
@@ -48,6 +48,17 @@ const ERC20_ABI = [
     ],
     outputs: [{ name: '', type: 'bool' }],
   },
+  {
+    name: 'transferFrom',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'from', type: 'address' },
+      { name: 'to', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
 ] as const;
 
 // ============================================================================
@@ -59,16 +70,19 @@ export class PaymentHandler {
   private readonly chain: typeof baseSepolia | typeof base;
   private readonly usdcAddress: `0x${string}`;
   private readonly receiverAddress: `0x${string}`;
+  private readonly privateKey: `0x${string}` | null;
 
   constructor() {
-    this.network = process.env.X402_NETWORK || 'base-sepolia';
+    // Support both old (X402_NETWORK) and new (NETWORK) env vars
+    this.network = process.env.NETWORK || process.env.X402_NETWORK || 'base-sepolia';
     this.chain = CHAINS[this.network] || baseSepolia;
     this.usdcAddress = USDC_ADDRESSES[this.network] || USDC_ADDRESSES['base-sepolia'];
     this.receiverAddress = (process.env.PAYMENT_RECEIVER_ADDRESS || '0x0000000000000000000000000000000000000000') as `0x${string}`;
+    this.privateKey = process.env.PAYMENT_RECEIVER_PRIVATE_KEY as `0x${string}` | null;
   }
 
   /**
-   * Get payment configuration for x402
+   * Get payment configuration
    */
   getPaymentConfig(amountUsdc: string): {
     network: string;
@@ -87,7 +101,123 @@ export class PaymentHandler {
   }
 
   /**
-   * Verify a payment was received
+   * Get USDC allowance that a wallet has approved for the gateway
+   */
+  async getAllowance(ownerAddress: `0x${string}`): Promise<string> {
+    const publicClient = createPublicClient({
+      chain: this.chain,
+      transport: http(),
+    });
+
+    const allowance = await publicClient.readContract({
+      address: this.usdcAddress,
+      abi: ERC20_ABI,
+      functionName: 'allowance',
+      args: [ownerAddress, this.receiverAddress],
+    });
+
+    return allowance.toString();
+  }
+
+  /**
+   * Pull USDC from a user's wallet using transferFrom
+   * Requires the user to have approved the gateway address
+   */
+  async pullPayment(
+    fromAddress: `0x${string}`,
+    amount: string
+  ): Promise<{
+    success: boolean;
+    txHash?: string;
+    error?: string;
+  }> {
+    if (!this.privateKey) {
+      return {
+        success: false,
+        error: 'Gateway private key not configured - cannot execute transferFrom',
+      };
+    }
+
+    try {
+      const publicClient = createPublicClient({
+        chain: this.chain,
+        transport: http(),
+      });
+
+      // Check allowance first
+      const allowance = await this.getAllowance(fromAddress);
+      const amountBigInt = BigInt(amount);
+
+      if (BigInt(allowance) < amountBigInt) {
+        return {
+          success: false,
+          error: `Insufficient allowance: have ${allowance}, need ${amount}`,
+        };
+      }
+
+      // Check user's balance
+      const balance = await this.getBalance(fromAddress);
+      if (BigInt(balance.balance) < amountBigInt) {
+        return {
+          success: false,
+          error: `Insufficient balance: have ${balance.balance}, need ${amount}`,
+        };
+      }
+
+      // Create wallet client for gateway
+      const account = privateKeyToAccount(this.privateKey);
+      const walletClient = createWalletClient({
+        account,
+        chain: this.chain,
+        transport: http(),
+      });
+
+      logger.info(
+        { from: fromAddress, to: this.receiverAddress, amount },
+        'Executing transferFrom'
+      );
+
+      // Execute transferFrom
+      const txHash = await walletClient.writeContract({
+        address: this.usdcAddress,
+        abi: ERC20_ABI,
+        functionName: 'transferFrom',
+        args: [fromAddress, this.receiverAddress, amountBigInt],
+      });
+
+      logger.info({ txHash, amount }, 'TransferFrom submitted');
+
+      // Wait for confirmation
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash: txHash,
+        confirmations: 1,
+      });
+
+      if (receipt.status !== 'success') {
+        return {
+          success: false,
+          txHash,
+          error: 'Transaction failed on-chain',
+        };
+      }
+
+      logger.info({ txHash, amount }, 'Payment pulled successfully');
+
+      return {
+        success: true,
+        txHash,
+      };
+    } catch (error) {
+      logger.error({ error, fromAddress, amount }, 'Failed to pull payment');
+      return {
+        success: false,
+        error: `TransferFrom failed: ${error}`,
+      };
+    }
+  }
+
+  /**
+   * Verify a payment was received (for manual payment verification)
    */
   async verifyPayment(
     txHash: `0x${string}`,
@@ -187,6 +317,20 @@ export class PaymentHandler {
       balance: balance.toString(),
       formatted: formatUnits(balance, 6),
     };
+  }
+
+  /**
+   * Get the receiver (gateway) address
+   */
+  getReceiverAddress(): `0x${string}` {
+    return this.receiverAddress;
+  }
+
+  /**
+   * Get the network
+   */
+  getNetwork(): string {
+    return this.network;
   }
 
   /**

@@ -1,5 +1,5 @@
 {
-  "name": "agent-pay",
+  "name": "@maimond123/agent-pay",
   "version": "0.1.0",
   "description": "MCP server for provisioning paid developer services — starting with Akash compute",
   "type": "module",

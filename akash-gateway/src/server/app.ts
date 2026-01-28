@@ -1,42 +1,27 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { paymentMiddleware, x402ResourceServer } from '@x402/express';
-import { ExactEvmScheme } from '@x402/evm/exact/server';
-import { HTTPFacilitatorClient } from '@x402/core/server';
 import computeRoutes from './routes/compute.js';
 import llmRoutes from './routes/llm.js';
-import paymentRoutes from './routes/payment.js';
+import authRoutes from './routes/auth.js';
 import { logger } from './logger.js';
-import { getStats, getQuote, isQuoteValid } from '../db/store.js';
+import { getStats } from '../db/store.js';
+import { verifyToken } from '../db/tokens.js';
 
 // ============================================================================
 // EXPRESS APP SETUP
 // ============================================================================
 
+// Extend Express Request to include wallet info
+declare global {
+  namespace Express {
+    interface Request {
+      walletAddress?: string;
+    }
+  }
+}
+
 export function createApp() {
   const app = express();
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // X402 PAYMENT MIDDLEWARE SETUP
-  // ──────────────────────────────────────────────────────────────────────────
-
-  const paymentReceiverAddress = process.env.PAYMENT_RECEIVER_ADDRESS || '0x0000000000000000000000000000000000000000';
-  const x402Network = process.env.X402_NETWORK || 'base-sepolia';
-  const chainId = x402Network === 'base' ? 'eip155:8453' : 'eip155:84532'; // Base mainnet or Sepolia
-
-  // Initialize x402 resource server
-  let x402Server: x402ResourceServer | null = null;
-
-  try {
-    const facilitatorClient = new HTTPFacilitatorClient({
-      url: process.env.X402_FACILITATOR_URL || 'https://facilitator.x402.org'
-    });
-    x402Server = new x402ResourceServer(facilitatorClient)
-      .register(chainId, new ExactEvmScheme());
-    logger.info({ chainId }, 'x402 resource server initialized');
-  } catch (error) {
-    logger.warn({ error }, 'x402 middleware initialization failed - running without payment protection');
-  }
 
   // ──────────────────────────────────────────────────────────────────────────
   // MIDDLEWARE
@@ -49,9 +34,6 @@ export function createApp() {
     allowedHeaders: [
       'Content-Type',
       'Authorization',
-      'X-402-Receipt',
-      'X-Payment-TxHash',
-      'X-Payment-Proof',
     ],
   }));
 
@@ -73,94 +55,93 @@ export function createApp() {
     next();
   });
 
-  // API key authentication
-  const gatewayApiKey = process.env.GATEWAY_API_KEY;
-  if (gatewayApiKey) {
-    app.use((req: Request, res: Response, next: NextFunction) => {
-      // Allow health check and root info without auth
-      if (req.path === '/health' || req.path === '/') {
-        return next();
-      }
-      const authHeader = req.headers.authorization;
-      if (!authHeader || authHeader !== `Bearer ${gatewayApiKey}`) {
-        res.status(401).json({ error: 'Unauthorized — invalid or missing API key' });
-        return;
-      }
-      next();
-    });
-    logger.info('API key authentication enabled');
-  } else {
-    logger.warn('No GATEWAY_API_KEY set — all routes are unauthenticated');
-  }
-
   // ──────────────────────────────────────────────────────────────────────────
-  // X402 PAYMENT MIDDLEWARE (for provision endpoint)
+  // TOKEN AUTH MIDDLEWARE (for protected routes)
   // ──────────────────────────────────────────────────────────────────────────
 
-  // Dynamic pricing middleware - extracts price from quote
-  if (x402Server && process.env.ENABLE_X402_MIDDLEWARE === 'true') {
-    logger.info('x402 payment middleware enabled for /compute/provision');
+  const tokenAuthMiddleware = (req: Request, res: Response, next: NextFunction) => {
+    const authHeader = req.headers.authorization;
 
-    // Note: x402 middleware with dynamic pricing requires custom implementation
-    // For now, we use manual payment verification in the route handler
-    // Full x402 middleware would look like:
-    // app.use(paymentMiddleware({
-    //   'POST /compute/provision': {
-    //     accepts: { scheme: 'exact', network: chainId, payTo: paymentReceiverAddress },
-    //     getPricing: async (req) => {
-    //       const quoteId = req.body?.quoteId;
-    //       const quote = getQuote(quoteId);
-    //       return quote ? { price: `$${(parseInt(quote.pricing.totalUsdc) / 1_000_000).toFixed(2)}` } : null;
-    //     },
-    //   },
-    // }, x402Server));
-  }
+    if (!authHeader?.startsWith('Bearer ')) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Include Authorization: Bearer <token> header',
+        setup: 'Run `npx @anthropic/agent-pay setup` to get your token',
+      });
+    }
+
+    const token = authHeader.slice(7);
+    const result = verifyToken(token);
+
+    if (!result.valid) {
+      return res.status(401).json({
+        error: 'Invalid token',
+        message: result.error,
+        setup: 'Run `npx @anthropic/agent-pay setup` to get a new token',
+      });
+    }
+
+    // Attach wallet address to request for use in route handlers
+    req.walletAddress = result.walletAddress;
+    next();
+  };
 
   // ──────────────────────────────────────────────────────────────────────────
   // ROUTES
   // ──────────────────────────────────────────────────────────────────────────
 
-  // Health check
+  // Health check (public)
   app.get('/health', (req: Request, res: Response) => {
     const stats = getStats();
     res.json({
       status: 'ok',
       timestamp: Date.now(),
-      version: '1.0.0',
+      version: '2.0.0',
       stats,
     });
   });
 
-  // API info
+  // API info (public)
   app.get('/', (req: Request, res: Response) => {
     res.json({
-      name: 'x402 Akash Gateway',
-      version: '1.0.0',
-      description: 'Pay for decentralized compute with USDC via x402 protocol',
+      name: 'Akash Gateway',
+      version: '2.0.0',
+      description: 'Pay for decentralized compute with USDC',
       endpoints: {
+        // Public
+        'GET /health': 'Health check',
+        'POST /auth/register': 'Register wallet, get auth token',
+        'POST /auth/verify': 'Verify token',
+        'GET /auth/info': 'Get authenticated wallet info',
+        // Protected (require auth token)
         'POST /compute/quote': 'Get pricing for compute specs',
-        'POST /compute/provision': 'Deploy compute (requires payment)',
+        'POST /compute/quotes': 'Get multi-provider quotes',
+        'POST /compute/provision': 'Deploy compute (auto-charges wallet)',
         'GET /compute/:id/status': 'Get deployment status',
         'GET /compute': 'List all deployments',
-        'GET /compute/stats': 'Get gateway statistics',
-        'GET /health': 'Health check',
+        'POST /llm/analyze': 'Analyze task, recommend compute specs',
+        'POST /llm/select-provider': 'Select best provider from quotes',
+      },
+      authentication: {
+        type: 'Bearer token',
+        setup: 'Run `npx @anthropic/agent-pay setup` to connect wallet and get token',
       },
       payment: {
-        protocol: 'x402',
-        network: process.env.X402_NETWORK || 'base-sepolia',
+        method: 'USDC via ERC-20 approve + transferFrom',
+        network: process.env.NETWORK || 'base-sepolia',
         token: 'USDC',
       },
     });
   });
 
-  // Compute routes
-  app.use('/compute', computeRoutes);
+  // Auth routes (public)
+  app.use('/auth', authRoutes);
 
-  // LLM routes (for CRE workflow compatibility)
-  app.use('/llm', llmRoutes);
+  // Compute routes (protected)
+  app.use('/compute', tokenAuthMiddleware, computeRoutes);
 
-  // Payment routes (x402)
-  app.use('/x402', paymentRoutes);
+  // LLM routes (protected)
+  app.use('/llm', tokenAuthMiddleware, llmRoutes);
 
   // ──────────────────────────────────────────────────────────────────────────
   // ERROR HANDLING

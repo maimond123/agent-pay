@@ -12,26 +12,26 @@ async function main() {
 
   console.log(`
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                        x402 AKASH GATEWAY                                    ║
+║                          AKASH GATEWAY                                       ║
 ║             Pay for Decentralized Compute with USDC                          ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
 ║  This gateway enables AI agents to provision compute on Akash Network        ║
-║  using USDC payments via the x402 protocol.                                  ║
+║  using USDC payments with token-based authentication.                        ║
+║                                                                              ║
+║  Auth Endpoints:                                                             ║
+║  • POST /auth/register       - Register wallet, get auth token               ║
+║  • POST /auth/verify         - Verify token, get wallet address              ║
 ║                                                                              ║
 ║  Compute Endpoints:                                                          ║
-║  • POST /compute/quote        - Get pricing for compute specs                ║
-║  • POST /compute/quotes       - Get multi-provider quotes (CRE compatible)   ║
-║  • POST /compute/provision    - Deploy compute (requires payment)            ║
-║  • GET  /compute/:id/status   - Get deployment status                        ║
+║  • POST /compute/quote       - Get pricing for compute specs                 ║
+║  • POST /compute/quotes      - Get multi-provider quotes                     ║
+║  • POST /compute/provision   - Deploy compute (requires auth token)          ║
+║  • GET  /compute/:id/status  - Get deployment status                         ║
 ║                                                                              ║
-║  LLM Endpoints (for CRE workflow):                                           ║
-║  • POST /llm/analyze          - Analyze task, recommend compute specs        ║
-║  • POST /llm/select-provider  - Select best provider from quotes             ║
-║                                                                              ║
-║  Payment Endpoints (x402):                                                   ║
-║  • POST /x402/pay             - Process USDC payment                         ║
-║  • POST /x402/verify          - Verify payment transaction                   ║
+║  LLM Endpoints:                                                              ║
+║  • POST /llm/analyze         - Analyze task, recommend compute specs         ║
+║  • POST /llm/select-provider - Select best provider from quotes              ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 `);
@@ -49,12 +49,12 @@ async function main() {
   const app = createApp();
 
   const server = app.listen(port, () => {
-    logger.info({ port }, `x402 Akash Gateway running on http://localhost:${port}`);
+    logger.info({ port }, `Akash Gateway running on http://localhost:${port}`);
     console.log(`
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  Server running on http://localhost:${port}                                     │
 │                                                                              │
-│  Network: ${(process.env.X402_NETWORK || 'base-sepolia').padEnd(66)}│
+│  Network: ${(process.env.NETWORK || 'base-sepolia').padEnd(66)}│
 │  Mode: ${(process.env.AKASH_MNEMONIC ? 'Production (Akash connected)' : 'Mock (no wallet configured)').padEnd(69)}│
 └──────────────────────────────────────────────────────────────────────────────┘
 `);
