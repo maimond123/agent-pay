@@ -1,11 +1,11 @@
 {
-  "name": "@maimond123/agent-pay",
-  "version": "0.1.0",
+  "name": "@anthropic/agent-pay",
+  "version": "2.0.0",
   "description": "MCP server for provisioning paid developer services — starting with Akash compute",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "agent-pay": "dist/index.js"
+    "agent-pay": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -15,6 +15,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "setup": "tsx src/cli.ts setup",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -24,22 +25,25 @@
     "usdc",
     "compute",
     "agent",
-    "x402"
+    "walletconnect"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/maimond123/verifiable-agents.git",
-    "directory": "agent-pay"
+    "url": "git+https://github.com/anthropics/agent-pay.git"
   },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "@walletconnect/sign-client": "^2.17.0",
+    "@walletconnect/types": "^2.17.0",
+    "qrcode-terminal": "^0.12.0",
     "viem": "^2.21.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
     "tsx": "^4.19.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.7.0"
   },
   "engines": {
     "node": ">=18"

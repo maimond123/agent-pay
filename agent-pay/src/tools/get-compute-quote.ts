@@ -7,7 +7,7 @@ import type { UsdcWallet } from "../wallet.js";
 export function registerGetComputeQuote(
   server: McpServer,
   gateway: GatewayClient,
-  wallet: UsdcWallet | null,
+  _wallet: UsdcWallet | null, // Kept for backwards compatibility but not used
 ) {
   server.registerTool(
     "get_compute_quote",
@@ -49,7 +49,9 @@ export function registerGetComputeQuote(
     },
     async (args) => {
       try {
-        const { quotes } = await gateway.getMultiQuotes(args);
+        const response = await gateway.getMultiQuotes(args) as any;
+        const quotes = response.quotes || [];
+        const walletInfo = response.wallet;
 
         if (quotes.length === 0) {
           return {
@@ -62,18 +64,13 @@ export function registerGetComputeQuote(
           };
         }
 
-        // If wallet is configured, show balance (non-blocking)
+        // Show wallet balance from gateway response
         let balanceLine = "";
-        if (wallet) {
-          try {
-            const balance = await wallet.getBalance();
-            balanceLine = `Your wallet (${wallet.address}) has **${balance} USDC** on ${wallet.network}.\n\n`;
-          } catch {
-            // Network error — don't block showing quotes
-          }
+        if (walletInfo) {
+          balanceLine = `Your wallet (${walletInfo.address}) has **${walletInfo.balance} USDC** (allowance: ${walletInfo.allowance} USDC).\n\n`;
         }
 
-        const lines = quotes.map((q, i) => {
+        const lines = quotes.map((q: any, i: number) => {
           return [
             `**Option ${i + 1}: ${q.providerName}** (${q.region})`,
             `  Quote ID: ${q.quoteId}`,

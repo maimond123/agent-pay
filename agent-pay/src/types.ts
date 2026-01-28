@@ -204,4 +204,51 @@ export interface GatewayError {
     recipient: string;
     network: string;
   };
+  setup?: string;
+  action?: string;
+}
+
+// ── Auth Types ──
+
+export interface AuthRegisterResponse {
+  token: string;
+  walletAddress: string;
+  balance: {
+    usdc: string;
+    raw: string;
+  };
+  allowance: {
+    usdc: string;
+    raw: string;
+  };
+  message: string;
+}
+
+export interface AuthVerifyResponse {
+  valid: boolean;
+  walletAddress?: string;
+  error?: string;
+  balance?: {
+    usdc: string;
+    raw: string;
+  };
+  allowance?: {
+    usdc: string;
+    raw: string;
+  };
+}
+
+export interface AuthInfoResponse {
+  walletAddress: string;
+  balance: {
+    usdc: string;
+    raw: string;
+  };
+  allowance: {
+    usdc: string;
+    raw: string;
+    sufficient: boolean;
+  };
+  network: string;
+  gatewayAddress: string;
 }

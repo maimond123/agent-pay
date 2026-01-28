@@ -11,40 +11,42 @@ import type {
   AnalyzeResponse,
   SelectProviderRequest,
   SelectProviderResponse,
-  PayRequest,
-  PayResponse,
   GatewayError,
+  AuthRegisterResponse,
+  AuthVerifyResponse,
+  AuthInfoResponse,
 } from "./types.js";
 
 export class GatewayClient {
   private baseUrl: string;
-  private apiKey: string | undefined;
+  private token: string | undefined;
 
-  constructor(baseUrl: string, apiKey?: string) {
+  constructor(baseUrl: string, token?: string) {
     // Strip trailing slash
     this.baseUrl = baseUrl.replace(/\/+$/, "");
-    this.apiKey = apiKey;
+    this.token = token;
   }
 
   private async request<T>(
     method: string,
     path: string,
     body?: unknown,
-    headers?: Record<string, string>,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
-    const authHeaders: Record<string, string> = {};
-    if (this.apiKey) {
-      authHeaders["Authorization"] = `Bearer ${this.apiKey}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    // Add auth token if available
+    if (this.token) {
+      headers["Authorization"] = `Bearer ${this.token}`;
     }
+
     const opts: RequestInit = {
       method,
-      headers: {
-        "Content-Type": "application/json",
-        ...authHeaders,
-        ...headers,
-      },
+      headers,
     };
+
     if (body !== undefined) {
       opts.body = JSON.stringify(body);
     }
@@ -64,6 +66,22 @@ export class GatewayClient {
     return (await res.json()) as T;
   }
 
+  // ── Auth ──
+
+  async register(walletAddress: string): Promise<AuthRegisterResponse> {
+    return this.request<AuthRegisterResponse>("POST", "/auth/register", {
+      walletAddress,
+    });
+  }
+
+  async verify(): Promise<AuthVerifyResponse> {
+    return this.request<AuthVerifyResponse>("POST", "/auth/verify", {});
+  }
+
+  async getAuthInfo(): Promise<AuthInfoResponse> {
+    return this.request<AuthInfoResponse>("GET", "/auth/info");
+  }
+
   // ── Compute ──
 
   async getQuote(req: QuoteRequest): Promise<QuoteResponse> {
@@ -74,20 +92,11 @@ export class GatewayClient {
     return this.request<MultiQuoteResponse>("POST", "/compute/quotes", req);
   }
 
-  async provision(
-    req: ProvisionRequest,
-    paymentTxHash?: string,
-  ): Promise<ProvisionResponse> {
-    const headers: Record<string, string> = {};
-    if (paymentTxHash) {
-      headers["X-Payment-TxHash"] = paymentTxHash;
-    }
-    return this.request<ProvisionResponse>(
-      "POST",
-      "/compute/provision",
-      req,
-      headers,
-    );
+  /**
+   * Provision compute - gateway will automatically charge the authenticated wallet
+   */
+  async provision(req: ProvisionRequest): Promise<ProvisionResponse> {
+    return this.request<ProvisionResponse>("POST", "/compute/provision", req);
   }
 
   async getDeploymentStatus(deploymentId: string): Promise<DeploymentStatus> {
@@ -125,12 +134,6 @@ export class GatewayClient {
       "/llm/select-provider",
       req,
     );
-  }
-
-  // ── Payment ──
-
-  async pay(req: PayRequest): Promise<PayResponse> {
-    return this.request<PayResponse>("POST", "/x402/pay", req);
   }
 }
 

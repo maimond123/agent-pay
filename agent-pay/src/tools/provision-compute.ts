@@ -1,5 +1,4 @@
 import { z } from "zod";
-import type { Address } from "viem";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GatewayClient } from "../gateway-client.js";
 import { GatewayRequestError } from "../gateway-client.js";
@@ -8,7 +7,7 @@ import type { UsdcWallet } from "../wallet.js";
 export function registerProvisionCompute(
   server: McpServer,
   gateway: GatewayClient,
-  wallet: UsdcWallet | null,
+  _wallet: UsdcWallet | null, // Kept for backwards compatibility but not used
 ) {
   server.registerTool(
     "provision_compute",
@@ -156,43 +155,19 @@ export function registerProvisionCompute(
           selection.selectedQuoteId ?? quotes[0].quoteId;
         const chosenQuote = quotes.find((q) => q.quoteId === chosenQuoteId) ?? quotes[0];
 
-        // Step 4: Pay
-        let paymentTxHash: string;
-        let provisionQuoteId: string;
+        // Step 4: Provision - gateway handles payment automatically via transferFrom
+        const deployment = await gateway.provision({
+          quoteId: chosenQuoteId,
+          env: args.env,
+          command: args.command,
+          ports: args.ports,
+        });
 
-        if (wallet) {
-          // Real on-chain USDC payment
-          // Get a fresh single quote — it includes paymentDetails with raw amount + recipient
-          const singleQuote = await gateway.getQuote(quoteReq);
-          const recipient = singleQuote.paymentDetails
-            .recipient as Address;
-          const amount = BigInt(singleQuote.paymentDetails.amount);
+        // Get payment info from response
+        const paymentInfo = (deployment as any).payment || {};
+        const paymentTxHash = paymentInfo.txHash || "pending";
 
-          const transfer = await wallet.transferUsdc(recipient, amount);
-          paymentTxHash = transfer.txHash;
-          provisionQuoteId = singleQuote.quoteId;
-        } else {
-          // Dev mode: simulated payment via gateway
-          const payment = await gateway.pay({
-            quoteId: chosenQuoteId,
-            amount: chosenQuote.priceUsdc,
-          });
-          paymentTxHash = payment.txHash;
-          provisionQuoteId = chosenQuoteId;
-        }
-
-        // Step 5: Provision
-        const deployment = await gateway.provision(
-          {
-            quoteId: provisionQuoteId,
-            env: args.env,
-            command: args.command,
-            ports: args.ports,
-          },
-          paymentTxHash,
-        );
-
-        // Step 6: Poll for running status (up to 90s)
+        // Step 5: Poll for running status (up to 90s)
         let status = await gateway.getDeploymentStatus(
           deployment.deploymentId,
         );
@@ -237,12 +212,29 @@ export function registerProvisionCompute(
 
         return { content: [{ type: "text" as const, text }] };
       } catch (err) {
-        const msg =
-          err instanceof GatewayRequestError
-            ? `Gateway error (${err.status}): ${err.message}`
-            : err instanceof Error
-              ? err.message
-              : String(err);
+        if (err instanceof GatewayRequestError) {
+          // Handle payment failures with helpful message
+          if (err.status === 402) {
+            const body = err.body as any;
+            const msg = [
+              `Payment failed: ${body.reason || body.error}`,
+              "",
+              body.details ? `Required: ${body.details.required}` : "",
+              body.details ? `Allowance: ${body.details.allowance}` : "",
+              "",
+              body.action || "Run 'npx @anthropic/agent-pay setup' to configure your wallet.",
+            ].filter(Boolean).join("\n");
+            return {
+              content: [{ type: "text" as const, text: msg }],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: "text" as const, text: `Gateway error (${err.status}): ${err.message}` }],
+            isError: true,
+          };
+        }
+        const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text" as const, text: msg }],
           isError: true,

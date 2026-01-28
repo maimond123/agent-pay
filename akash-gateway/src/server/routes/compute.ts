@@ -3,7 +3,6 @@ import {
   ComputeQuoteRequestSchema,
   ComputeProvisionRequestSchema,
   type ComputeQuote,
-  type ProvisionResponse,
 } from '../../types/index.js';
 import { calculatePrice, parseToMb, formatUsd } from '../../pricing/calculator.js';
 import {
@@ -49,7 +48,7 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
     }
 
     const specs = parsed.data;
-    logger.info({ specs }, 'Quote requested');
+    logger.info({ specs, wallet: req.walletAddress }, 'Quote requested');
 
     // Calculate pricing
     const memoryMb = parseToMb(specs.memory);
@@ -110,10 +109,8 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
 });
 
 // ============================================================================
-// MULTI-PROVIDER QUOTES ENDPOINT (CRE Workflow Compatible)
+// MULTI-PROVIDER QUOTES ENDPOINT
 // ============================================================================
-// This endpoint simulates multiple providers returning quotes
-// Compatible with the agent-ai-compute CRE workflow
 
 router.post('/quotes', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -133,7 +130,7 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
     }
 
     const specs = parsed.data;
-    logger.info({ specs }, 'Multi-provider quotes requested');
+    logger.info({ specs, wallet: req.walletAddress }, 'Multi-provider quotes requested');
 
     const memoryMb = parseToMb(specs.memory);
     const storageMb = parseToMb(specs.storage);
@@ -183,7 +180,6 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
 
       saveQuote(quote);
 
-      // Return in CRE workflow compatible format
       return {
         quoteId: quote.quoteId,
         provider: provider.id,
@@ -197,21 +193,37 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
       };
     });
 
+    // Get user's wallet info for response
+    let walletInfo = null;
+    if (req.walletAddress) {
+      try {
+        const balance = await paymentHandler.getBalance(req.walletAddress as `0x${string}`);
+        const allowance = await paymentHandler.getAllowance(req.walletAddress as `0x${string}`);
+        walletInfo = {
+          address: req.walletAddress,
+          balance: balance.formatted,
+          allowance: (parseInt(allowance) / 1_000_000).toFixed(2),
+        };
+      } catch (error) {
+        logger.warn({ error }, 'Failed to fetch wallet info');
+      }
+    }
+
     logger.info({ count: quotes.length }, 'Multi-provider quotes created');
 
-    return res.json({ quotes });
+    return res.json({ quotes, wallet: walletInfo });
   } catch (error) {
     next(error);
   }
 });
 
 // ============================================================================
-// PROVISION ENDPOINT - Deploy compute (requires x402 payment)
+// PROVISION ENDPOINT - Deploy compute (auto-charges via transferFrom)
 // ============================================================================
 
 router.post('/provision', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Validate request - support CRE workflow format
+    // Validate request
     const parsed = ComputeProvisionRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
@@ -221,12 +233,16 @@ router.post('/provision', async (req: Request, res: Response, next: NextFunction
     }
 
     const { quoteId, env, command, ports } = parsed.data;
+    const walletAddress = req.walletAddress;
 
-    // Get x402 payment proof from header OR body (CRE workflow compatibility)
-    const paymentProof = req.headers['x-402-receipt'] as string | undefined;
-    const paymentTxHash = (req.headers['x-payment-txhash'] || req.headers['x-payment-proof'] || req.body.paymentTx) as string | undefined;
+    if (!walletAddress) {
+      return res.status(401).json({
+        error: 'Wallet address not found',
+        message: 'Authentication token does not contain a valid wallet address',
+      });
+    }
 
-    logger.info({ quoteId, hasPaymentProof: !!paymentProof, hasTxHash: !!paymentTxHash }, 'Provision requested');
+    logger.info({ quoteId, wallet: walletAddress }, 'Provision requested');
 
     // Validate quote
     const quoteValidation = isQuoteValid(quoteId);
@@ -238,41 +254,46 @@ router.post('/provision', async (req: Request, res: Response, next: NextFunction
     }
 
     const quote = getQuote(quoteId)!;
+    const paymentHandler = getPaymentHandler();
 
-    // Verify payment (skip for simulated/mock payments)
-    const isSimulatedPayment = paymentTxHash?.startsWith('0x00000000000000000000000000000000');
+    // Pull payment from user's wallet via transferFrom
     const isDevelopment = process.env.NODE_ENV === 'development' || !process.env.NODE_ENV;
+    let paymentTxHash: string | undefined;
 
-    if (paymentTxHash && !isSimulatedPayment) {
-      const paymentHandler = getPaymentHandler();
-      const verification = await paymentHandler.verifyPayment(
-        paymentTxHash as `0x${string}`,
+    if (!isDevelopment) {
+      // Production: Actually charge the user
+      const paymentResult = await paymentHandler.pullPayment(
+        walletAddress as `0x${string}`,
         quote.pricing.totalUsdc
       );
 
-      if (!verification.verified) {
+      if (!paymentResult.success) {
+        // Check if it's an allowance issue
+        const allowance = await paymentHandler.getAllowance(walletAddress as `0x${string}`);
+        const allowanceUsd = (parseInt(allowance) / 1_000_000).toFixed(2);
+        const requiredUsd = (parseInt(quote.pricing.totalUsdc) / 1_000_000).toFixed(2);
+
         return res.status(402).json({
-          error: 'Payment verification failed',
-          reason: verification.reason,
-          required: {
-            amount: quote.pricing.totalUsdc,
-            token: quote.paymentDetails.token,
-            recipient: quote.paymentDetails.recipient,
-            network: quote.paymentDetails.network,
+          error: 'Payment failed',
+          reason: paymentResult.error,
+          details: {
+            required: `${requiredUsd} USDC`,
+            allowance: `${allowanceUsd} USDC`,
+            wallet: walletAddress,
+            gatewayAddress: paymentHandler.getReceiverAddress(),
           },
+          action: parseInt(allowance) < parseInt(quote.pricing.totalUsdc)
+            ? 'Increase your USDC allowance for the gateway address'
+            : 'Ensure you have sufficient USDC balance',
         });
       }
 
-      logger.info({ txHash: paymentTxHash, amount: verification.actualAmount }, 'Payment verified');
-    } else if (paymentTxHash && isSimulatedPayment) {
-      logger.info({ txHash: paymentTxHash }, 'Simulated payment accepted');
-    } else if (!paymentProof && !isDevelopment) {
-      // In production, require payment
-      return res.status(402).json({
-        error: 'Payment required',
-        paymentDetails: quote.paymentDetails,
-        message: 'Send USDC payment and include X-Payment-TxHash header',
-      });
+      paymentTxHash = paymentResult.txHash;
+      logger.info({ txHash: paymentTxHash, amount: quote.pricing.totalUsdc, wallet: walletAddress }, 'Payment pulled successfully');
+    } else {
+      // Development: Simulate payment
+      paymentTxHash = `0x${Buffer.from(Date.now().toString()).toString('hex').padStart(64, '0')}`;
+      logger.info({ txHash: paymentTxHash }, 'Simulated payment (development mode)');
     }
 
     // Mark quote as used
@@ -294,7 +315,6 @@ router.post('/provision', async (req: Request, res: Response, next: NextFunction
     // Generate mock host for immediate response (real endpoints come from status polling)
     const mockHost = `${deployment.deploymentId}.akash.network`;
 
-    // CRE workflow compatible response
     const response = {
       deploymentId: deployment.deploymentId,
       provider: req.body.provider || 'akash-provider-1',
@@ -312,6 +332,11 @@ router.post('/provision', async (req: Request, res: Response, next: NextFunction
         sshPort: 22,
         sshUser: 'root',
         accessToken: `token_${deployment.deploymentId.slice(-16)}`,
+      },
+      payment: {
+        txHash: paymentTxHash,
+        amount: quote.pricing.totalUsd,
+        wallet: walletAddress,
       },
       message: 'Deployment initiated. Poll status endpoint for updates.',
     };
@@ -367,7 +392,6 @@ router.post('/:deploymentId/close', async (req: Request, res: Response, next: Ne
     }
 
     if (deployment.status === 'failed') {
-      // Just mark as stopped, nothing to close on Akash
       updateDeploymentStatus(deploymentId, 'stopped');
       return res.json({
         deploymentId,
