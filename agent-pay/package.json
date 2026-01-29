@@ -1,5 +1,5 @@
 {
-  "name": "@anthropic/agent-pay",
+  "name": "@agent-pay/mcp",
   "version": "2.0.0",
   "description": "MCP server for provisioning paid developer services — starting with Akash compute",
   "type": "module",

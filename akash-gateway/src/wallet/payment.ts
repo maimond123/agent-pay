@@ -19,7 +19,7 @@ const CHAINS: Record<string, typeof baseSepolia | typeof base> = {
   'base': base,
 };
 
-// ERC20 ABI (for balance, allowance, and transferFrom)
+// ERC20 ABI (for balance and allowance)
 const ERC20_ABI = [
   {
     name: 'balanceOf',
@@ -38,26 +38,43 @@ const ERC20_ABI = [
     ],
     outputs: [{ name: '', type: 'uint256' }],
   },
+] as const;
+
+// PaymentReceiver contract ABI
+const PAYMENT_RECEIVER_ABI = [
   {
-    name: 'transfer',
+    name: 'pullPayment',
     type: 'function',
     stateMutability: 'nonpayable',
     inputs: [
-      { name: 'to', type: 'address' },
+      { name: 'from', type: 'address' },
       { name: 'amount', type: 'uint256' },
     ],
     outputs: [{ name: '', type: 'bool' }],
   },
   {
-    name: 'transferFrom',
+    name: 'withdraw',
     type: 'function',
     stateMutability: 'nonpayable',
     inputs: [
-      { name: 'from', type: 'address' },
       { name: 'to', type: 'address' },
       { name: 'amount', type: 'uint256' },
     ],
-    outputs: [{ name: '', type: 'bool' }],
+    outputs: [],
+  },
+  {
+    name: 'balance',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    name: 'getAllowance',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'user', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
   },
 ] as const;
 
@@ -173,19 +190,19 @@ export class PaymentHandler {
       });
 
       logger.info(
-        { from: fromAddress, to: this.receiverAddress, amount },
-        'Executing transferFrom'
+        { from: fromAddress, contract: this.receiverAddress, amount },
+        'Executing pullPayment on contract'
       );
 
-      // Execute transferFrom
+      // Call pullPayment on the PaymentReceiver contract
       const txHash = await walletClient.writeContract({
-        address: this.usdcAddress,
-        abi: ERC20_ABI,
-        functionName: 'transferFrom',
-        args: [fromAddress, this.receiverAddress, amountBigInt],
+        address: this.receiverAddress,
+        abi: PAYMENT_RECEIVER_ABI,
+        functionName: 'pullPayment',
+        args: [fromAddress, amountBigInt],
       });
 
-      logger.info({ txHash, amount }, 'TransferFrom submitted');
+      logger.info({ txHash, amount }, 'pullPayment submitted');
 
       // Wait for confirmation
       const receipt = await publicClient.waitForTransactionReceipt({
@@ -201,7 +218,7 @@ export class PaymentHandler {
         };
       }
 
-      logger.info({ txHash, amount }, 'Payment pulled successfully');
+      logger.info({ txHash, amount }, 'Payment pulled via contract successfully');
 
       return {
         success: true,

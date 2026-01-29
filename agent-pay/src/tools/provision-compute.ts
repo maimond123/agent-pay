@@ -216,16 +216,23 @@ export function registerProvisionCompute(
           // Handle payment failures with helpful message
           if (err.status === 402) {
             const body = err.body as any;
-            const msg = [
-              `Payment failed: ${body.reason || body.error}`,
+            const lines = [
+              "## Insufficient Spending Allowance",
               "",
-              body.details ? `Required: ${body.details.required}` : "",
-              body.details ? `Allowance: ${body.details.allowance}` : "",
+              `This deployment costs **${body.details?.required || "unknown"}** but your current spending limit is **${body.details?.allowance || "$0.00"}**.`,
               "",
-              body.action || "Run 'npx @anthropic/agent-pay setup' to configure your wallet.",
-            ].filter(Boolean).join("\n");
+              "### To approve spending:",
+              "",
+              `\`\`\``,
+              body.action || "npx @agent-pay/mcp approve 50",
+              `\`\`\``,
+              "",
+              body.hint || "This will open your wallet to set a spending limit. No funds are charged until you provision compute.",
+              "",
+              "After approving, come back here and try again!",
+            ];
             return {
-              content: [{ type: "text" as const, text: msg }],
+              content: [{ type: "text" as const, text: lines.join("\n") }],
               isError: true,
             };
           }

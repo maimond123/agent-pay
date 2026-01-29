@@ -273,18 +273,24 @@ router.post('/provision', async (req: Request, res: Response, next: NextFunction
         const allowanceUsd = (parseInt(allowance) / 1_000_000).toFixed(2);
         const requiredUsd = (parseInt(quote.pricing.totalUsdc) / 1_000_000).toFixed(2);
 
+        // Calculate suggested approval amount (round up to nearest $10)
+        const suggestedApproval = Math.ceil(parseFloat(requiredUsd) / 10) * 10;
+
         return res.status(402).json({
           error: 'Payment failed',
           reason: paymentResult.error,
           details: {
-            required: `${requiredUsd} USDC`,
-            allowance: `${allowanceUsd} USDC`,
+            required: `$${requiredUsd} USDC`,
+            allowance: `$${allowanceUsd} USDC`,
             wallet: walletAddress,
             gatewayAddress: paymentHandler.getReceiverAddress(),
           },
           action: parseInt(allowance) < parseInt(quote.pricing.totalUsdc)
-            ? 'Increase your USDC allowance for the gateway address'
-            : 'Ensure you have sufficient USDC balance',
+            ? `Run: npx @agent-pay/mcp approve ${suggestedApproval}`
+            : 'Ensure you have sufficient USDC balance in your wallet',
+          hint: parseInt(allowance) < parseInt(quote.pricing.totalUsdc)
+            ? 'This will open your wallet to approve the spending limit. No funds are charged until you provision compute.'
+            : undefined,
         });
       }
 

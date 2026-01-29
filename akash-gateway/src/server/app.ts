@@ -66,7 +66,7 @@ export function createApp() {
       return res.status(401).json({
         error: 'Unauthorized',
         message: 'Include Authorization: Bearer <token> header',
-        setup: 'Run `npx @anthropic/agent-pay setup` to get your token',
+        setup: 'Run `npx @agent-pay/mcp setup` to get your token',
       });
     }
 
@@ -77,7 +77,7 @@ export function createApp() {
       return res.status(401).json({
         error: 'Invalid token',
         message: result.error,
-        setup: 'Run `npx @anthropic/agent-pay setup` to get a new token',
+        setup: 'Run `npx @agent-pay/mcp setup` to get a new token',
       });
     }
 
@@ -124,12 +124,13 @@ export function createApp() {
       },
       authentication: {
         type: 'Bearer token',
-        setup: 'Run `npx @anthropic/agent-pay setup` to connect wallet and get token',
+        setup: 'Run `npx @agent-pay/mcp setup` to connect wallet and get token',
       },
       payment: {
         method: 'USDC via ERC-20 approve + transferFrom',
         network: process.env.NETWORK || 'base-sepolia',
         token: 'USDC',
+        gatewayAddress: process.env.PAYMENT_RECEIVER_ADDRESS || '0x0000000000000000000000000000000000000000',
       },
     });
   });

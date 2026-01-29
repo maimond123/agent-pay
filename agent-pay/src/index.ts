@@ -23,11 +23,11 @@ if (!TOKEN) {
 
 No authentication token found. Run setup to connect your wallet:
 
-  npx @anthropic/agent-pay setup
+  npx @agent-pay/mcp setup
 
 This will:
   1. Connect your mobile wallet via QR code
-  2. Approve USDC spending for compute
+  2. Register with the gateway
   3. Automatically configure agent-pay
 
 After setup, you can use commands like:
