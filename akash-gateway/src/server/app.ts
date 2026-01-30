@@ -6,6 +6,7 @@ import authRoutes from './routes/auth.js';
 import { logger } from './logger.js';
 import { getStats } from '../db/store.js';
 import { verifyToken } from '../db/tokens.js';
+import { getEscrowClient } from '../escrow/client.js';
 
 // ============================================================================
 // EXPRESS APP SETUP
@@ -103,6 +104,8 @@ export function createApp() {
 
   // API info (public)
   app.get('/', (req: Request, res: Response) => {
+    const escrowClient = getEscrowClient();
+
     res.json({
       name: 'Akash Gateway',
       version: '2.0.0',
@@ -116,7 +119,8 @@ export function createApp() {
         // Protected (require auth token)
         'POST /compute/quote': 'Get pricing for compute specs',
         'POST /compute/quotes': 'Get multi-provider quotes',
-        'POST /compute/provision': 'Deploy compute (auto-charges wallet)',
+        'GET /compute/quote/:quoteId': 'Get quote by ID',
+        'POST /compute/provision': 'Deploy compute (legacy direct payment)',
         'GET /compute/:id/status': 'Get deployment status',
         'GET /compute': 'List all deployments',
         'POST /llm/analyze': 'Analyze task, recommend compute specs',
@@ -127,10 +131,23 @@ export function createApp() {
         setup: 'Run `npx @agent-pay/mcp setup` to connect wallet and get token',
       },
       payment: {
-        method: 'USDC via ERC-20 approve + transferFrom',
+        method: 'USDC via escrow contract',
         network: process.env.NETWORK || 'base-sepolia',
         token: 'USDC',
         gatewayAddress: process.env.PAYMENT_RECEIVER_ADDRESS || '0x0000000000000000000000000000000000000000',
+      },
+      escrow: escrowClient.isEnabled() ? {
+        enabled: true,
+        contract: escrowClient.getEscrowAddress(),
+        features: [
+          'Funds held until deployment succeeds',
+          'Instant refund on failure',
+          '1-hour timeout if gateway goes silent',
+          'Excess funds automatically returned',
+        ],
+      } : {
+        enabled: false,
+        message: 'Escrow contract not configured',
       },
     });
   });

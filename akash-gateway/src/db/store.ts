@@ -1,6 +1,10 @@
 import { nanoid } from 'nanoid';
 import type { StoredQuote, DeploymentInfo, ComputeQuote } from '../types/index.js';
 import { logger } from '../server/logger.js';
+import type { Hex } from 'viem';
+
+// Re-export types for convenience
+export type { StoredQuote, DeploymentInfo, ComputeQuote };
 
 // ============================================================================
 // IN-MEMORY STORE (Replace with real database in production)
@@ -8,6 +12,8 @@ import { logger } from '../server/logger.js';
 
 const quotes = new Map<string, StoredQuote>();
 const deployments = new Map<string, DeploymentInfo>();
+const specsHashToQuote = new Map<Hex, StoredQuote>(); // Index by specsHash
+const escrowIdToDeployment = new Map<Hex, string>(); // escrowId -> deploymentId
 
 // Cleanup expired quotes every 5 minutes
 setInterval(() => {
@@ -40,6 +46,12 @@ export function saveQuote(quote: ComputeQuote): StoredQuote {
     used: false,
   };
   quotes.set(quote.quoteId, storedQuote);
+
+  // Also index by specsHash if present
+  if (storedQuote.specsHash) {
+    specsHashToQuote.set(storedQuote.specsHash as Hex, storedQuote);
+  }
+
   logger.debug({ quoteId: quote.quoteId }, 'Quote saved');
   return storedQuote;
 }
@@ -209,6 +221,75 @@ export function listQuotes(includeUsed = false): StoredQuote[] {
   }
 
   return results.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// ============================================================================
+// ESCROW-RELATED OPERATIONS
+// ============================================================================
+
+/**
+ * Get a quote by its specsHash
+ */
+export function getQuoteBySpecsHash(specsHash: Hex): StoredQuote | undefined {
+  return specsHashToQuote.get(specsHash);
+}
+
+/**
+ * Create a deployment record from an escrow deposit
+ */
+export function createDeploymentFromEscrow(
+  escrowId: Hex,
+  userAddress: string,
+  quote: StoredQuote
+): DeploymentInfo {
+  const deploymentId = generateDeploymentId();
+  const now = Date.now();
+
+  const deployment: DeploymentInfo = {
+    deploymentId,
+    status: 'pending',
+    quoteId: quote.quoteId,
+    escrowId,
+    userAddress,
+    akash: {},
+    specs: quote.specs,
+    expiresAt: now + (quote.specs.hours * 60 * 60 * 1000),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  deployments.set(deploymentId, deployment);
+  escrowIdToDeployment.set(escrowId, deploymentId);
+
+  logger.info({ deploymentId, escrowId, quoteId: quote.quoteId }, 'Deployment created from escrow');
+  return deployment;
+}
+
+/**
+ * Get deployment by escrow ID
+ */
+export function getDeploymentByEscrowId(escrowId: Hex): DeploymentInfo | undefined {
+  const deploymentId = escrowIdToDeployment.get(escrowId);
+  if (!deploymentId) return undefined;
+  return deployments.get(deploymentId);
+}
+
+/**
+ * Set escrow proof/failure transaction hash
+ */
+export function setEscrowProofTx(
+  deploymentId: string,
+  txHash: string
+): DeploymentInfo | undefined {
+  const deployment = deployments.get(deploymentId);
+  if (!deployment) return undefined;
+
+  deployment.escrowProofTx = txHash;
+  deployment.updatedAt = Date.now();
+  deployments.set(deploymentId, deployment);
+
+  logger.debug({ deploymentId, txHash }, 'Escrow proof tx set');
+  return deployment;
 }
 
 // ============================================================================

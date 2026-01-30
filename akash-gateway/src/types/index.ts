@@ -49,6 +49,7 @@ export const DeploymentStatusRequestSchema = z.object({
 
 export interface ComputeQuote {
   quoteId: string;
+  specsHash?: string; // Hash for escrow matching
   specs: {
     cpu: number;
     memory: string;
@@ -73,6 +74,11 @@ export interface ComputeQuote {
     recipient: string;
     amount: string;
   };
+  escrow?: {
+    contract: string;
+    quotedAmount: string; // USDC in 6 decimals
+    suggestedDeposit: string; // With buffer
+  };
   validUntil: number;
   createdAt: number;
 }
@@ -82,6 +88,10 @@ export interface DeploymentInfo {
   status: 'pending' | 'deploying' | 'running' | 'stopped' | 'failed';
   quoteId: string;
   paymentTxHash?: string;
+  // Escrow-related fields
+  escrowId?: string;
+  userAddress?: string;
+  escrowProofTx?: string; // Tx hash of submitProof or reportFailure
   akash: {
     dseq?: string;
     gseq?: number;

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { createApp } from './server/app.js';
 import { initializeAkashClient } from './akash/client.js';
+import { startEscrowListener } from './escrow/index.js';
 import { logger } from './server/logger.js';
 
 // ============================================================================
@@ -43,6 +44,15 @@ async function main() {
     logger.info('Akash client initialized');
   } catch (error) {
     logger.warn('Akash client initialization failed - running in mock mode');
+  }
+
+  // Start escrow event listener (watches for deposits on-chain)
+  logger.info('Starting escrow listener...');
+  try {
+    startEscrowListener();
+    logger.info('Escrow listener started');
+  } catch (error) {
+    logger.warn({ error }, 'Escrow listener failed to start - escrow features disabled');
   }
 
   // Create and start server

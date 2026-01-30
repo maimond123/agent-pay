@@ -2,7 +2,8 @@
 
 import { SignClient } from "@walletconnect/sign-client";
 import QRCode from "qrcode-terminal";
-import { encodeFunctionData, parseUnits, formatUnits } from "viem";
+import { encodeFunctionData, parseUnits, formatUnits, createPublicClient, http, type Hex } from "viem";
+import { base, baseSepolia } from "viem/chains";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -16,6 +17,12 @@ const NETWORK = process.env.AGENT_PAY_NETWORK || "base";
 const USDC_ADDRESSES: Record<string, `0x${string}`> = {
   "base-sepolia": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
   "base": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+};
+
+// Chain configs
+const CHAINS: Record<string, typeof base | typeof baseSepolia> = {
+  "base-sepolia": baseSepolia,
+  "base": base,
 };
 
 // Chain IDs for WalletConnect
@@ -35,6 +42,42 @@ const APPROVE_ABI = [
       { name: "amount", type: "uint256" },
     ],
     outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+
+// Escrow contract deposit ABI
+const ESCROW_DEPOSIT_ABI = [
+  {
+    name: "deposit",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "specsHash", type: "bytes32" },
+      { name: "quotedAmount", type: "uint256" },
+      { name: "depositAmount", type: "uint256" },
+    ],
+    outputs: [{ name: "escrowId", type: "bytes32" }],
+  },
+] as const;
+
+// Escrow contract read ABI
+const ESCROW_READ_ABI = [
+  {
+    name: "escrows",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "", type: "bytes32" }],
+    outputs: [
+      { name: "user", type: "address" },
+      { name: "depositAmount", type: "uint256" },
+      { name: "quotedAmount", type: "uint256" },
+      { name: "specsHash", type: "bytes32" },
+      { name: "createdAt", type: "uint256" },
+      { name: "status", type: "uint8" },
+      { name: "akashDseq", type: "string" },
+      { name: "akashProvider", type: "string" },
+      { name: "actualCost", type: "uint256" },
+    ],
   },
 ] as const;
 
@@ -415,6 +458,281 @@ async function status() {
 }
 
 // ============================================================================
+// DEPOSIT COMMAND
+// ============================================================================
+
+async function deposit(quoteIdArg?: string) {
+  const config = loadConfig();
+  if (!config) {
+    console.error("Not set up yet. Run: npx @agent-pay/mcp setup");
+    process.exit(1);
+  }
+
+  if (!quoteIdArg) {
+    console.error("Usage: npx @agent-pay/mcp deposit <quoteId>");
+    console.error("\nGet a quote first by asking Claude for compute.");
+    process.exit(1);
+  }
+
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                    Deposit into Escrow                        ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  // Fetch quote details from gateway
+  console.log("Fetching quote details...\n");
+
+  let quote: any;
+  try {
+    const response = await fetch(`${config.gatewayUrl}/compute/quote/${quoteIdArg}`, {
+      headers: { Authorization: `Bearer ${config.token}` },
+    });
+
+    if (!response.ok) {
+      // Quote endpoint might not exist, try to get from quotes list
+      console.error("Quote not found. Please request a new quote via Claude.");
+      process.exit(1);
+    }
+
+    quote = await response.json();
+  } catch (error) {
+    console.error("Failed to fetch quote. Please request a new quote via Claude.");
+    process.exit(1);
+  }
+
+  if (!quote.escrow) {
+    console.error("This quote does not support escrow deposits.");
+    console.error("The gateway may not have escrow enabled.");
+    process.exit(1);
+  }
+
+  const escrowContract = quote.escrow.contract as `0x${string}`;
+  const specsHash = quote.specsHash as `0x${string}`;
+  const quotedAmount = BigInt(quote.escrow.quotedAmount);
+  const depositAmount = BigInt(quote.escrow.suggestedDeposit);
+  const depositUsd = (Number(depositAmount) / 1_000_000).toFixed(2);
+  const quotedUsd = (Number(quotedAmount) / 1_000_000).toFixed(2);
+
+  console.log("Quote Details:");
+  console.log(`  Specs: ${quote.specs.cpu} CPU, ${quote.specs.memory} RAM, ${quote.specs.storage} storage`);
+  console.log(`  Image: ${quote.specs.image}`);
+  console.log(`  Duration: ${quote.specs.hours} hours`);
+  console.log(`  Cost: $${quotedUsd} USDC\n`);
+
+  console.log(`Deposit Amount: $${depositUsd} USDC (includes buffer)\n`);
+
+  console.log("Your Protections:");
+  console.log("  ✓ Funds held in escrow (not sent to gateway yet)");
+  console.log("  ✓ Full refund if deployment fails");
+  console.log("  ✓ Excess refunded after deployment");
+  console.log("  ✓ All transactions recorded on-chain\n");
+
+  // Initialize WalletConnect
+  console.log("Initializing WalletConnect...\n");
+  const signClient = await initWalletConnect();
+
+  console.log("Scan QR code to connect and approve deposit:\n");
+  const { session, walletAddress } = await connectWallet(signClient);
+
+  if (walletAddress.toLowerCase() !== config.walletAddress.toLowerCase()) {
+    console.error(`\nWallet mismatch!`);
+    console.error(`  Expected: ${config.walletAddress}`);
+    console.error(`  Got: ${walletAddress}`);
+    process.exit(1);
+  }
+
+  console.log(`✓ Connected: ${walletAddress}\n`);
+
+  const chainId = CHAIN_IDS[config.network] || CHAIN_IDS["base"];
+  const usdcAddress = USDC_ADDRESSES[config.network] || USDC_ADDRESSES["base"];
+
+  // Step 1: Approve USDC spending for escrow contract
+  console.log("Step 1/2: Approving USDC spending for escrow...\n");
+  console.log("┌─────────────────────────────────────────────────────────────┐");
+  console.log("│  Check your wallet to approve USDC spending.                │");
+  console.log(`│  Amount: $${depositUsd} USDC                                 `);
+  console.log("│  Spender: AgentPayEscrow (verified contract)                │");
+  console.log("└─────────────────────────────────────────────────────────────┘\n");
+
+  const approveData = encodeFunctionData({
+    abi: APPROVE_ABI,
+    functionName: "approve",
+    args: [escrowContract, depositAmount],
+  });
+
+  try {
+    const approveTxHash = await signClient.request({
+      topic: session.topic,
+      chainId,
+      request: {
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from: walletAddress,
+            to: usdcAddress,
+            data: approveData,
+          },
+        ],
+      },
+    });
+
+    console.log(`✓ Approval submitted: ${approveTxHash}`);
+    console.log("Waiting for confirmation...\n");
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  } catch (error) {
+    console.error("\nApproval was rejected.");
+    process.exit(1);
+  }
+
+  // Step 2: Deposit into escrow
+  console.log("Step 2/2: Depositing into escrow...\n");
+  console.log("┌─────────────────────────────────────────────────────────────┐");
+  console.log("│  Check your wallet to confirm the deposit.                  │");
+  console.log(`│  Amount: $${depositUsd} USDC into escrow                     `);
+  console.log("└─────────────────────────────────────────────────────────────┘\n");
+
+  const depositData = encodeFunctionData({
+    abi: ESCROW_DEPOSIT_ABI,
+    functionName: "deposit",
+    args: [specsHash, quotedAmount, depositAmount],
+  });
+
+  try {
+    const depositTxHash = await signClient.request({
+      topic: session.topic,
+      chainId,
+      request: {
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from: walletAddress,
+            to: escrowContract,
+            data: depositData,
+          },
+        ],
+      },
+    });
+
+    console.log(`✓ Deposit submitted!`);
+    console.log(`  Transaction: ${depositTxHash}\n`);
+    console.log("Waiting for confirmation...\n");
+    await new Promise((resolve) => setTimeout(resolve, 10000));
+
+    console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                    Deposit Complete!                          ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Amount: $${depositUsd} USDC
+  Status: Deposited - waiting for deployment
+
+  The gateway will now deploy your compute.
+  You'll be notified in Claude when it's ready.
+
+  Track on Basescan: https://basescan.org/tx/${depositTxHash}
+`);
+  } catch (error) {
+    console.error("\nDeposit was rejected.");
+    process.exit(1);
+  }
+
+  await signClient.disconnect({
+    topic: session.topic,
+    reason: { code: 6000, message: "Deposit complete" },
+  });
+
+  process.exit(0);
+}
+
+// ============================================================================
+// ESCROW STATUS COMMAND
+// ============================================================================
+
+async function escrowStatus(escrowIdArg?: string) {
+  const config = loadConfig();
+  if (!config) {
+    console.error("Not set up yet. Run: npx @agent-pay/mcp setup");
+    process.exit(1);
+  }
+
+  if (!escrowIdArg) {
+    console.error("Usage: npx @agent-pay/mcp escrow-status <escrowId>");
+    process.exit(1);
+  }
+
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                    Escrow Status                              ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  // Get escrow contract address from gateway
+  let escrowContract: `0x${string}`;
+  try {
+    const response = await fetch(`${config.gatewayUrl}/`);
+    const info = await response.json() as any;
+    escrowContract = info.escrow?.contract;
+    if (!escrowContract) {
+      console.error("Escrow contract not configured on gateway.");
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error("Failed to fetch gateway info.");
+    process.exit(1);
+  }
+
+  // Read escrow status from chain
+  const chain = CHAINS[config.network] || CHAINS["base"];
+  const client = createPublicClient({
+    chain,
+    transport: http(),
+  });
+
+  try {
+    const result = await client.readContract({
+      address: escrowContract,
+      abi: ESCROW_READ_ABI,
+      functionName: "escrows",
+      args: [escrowIdArg as Hex],
+    }) as [string, bigint, bigint, Hex, bigint, number, string, string, bigint];
+
+    const [user, depositAmount, quotedAmount, specsHash, createdAt, status, akashDseq, akashProvider, actualCost] = result;
+
+    const statusNames = ["None", "Deposited", "Released", "Refunded"];
+    const statusName = statusNames[status] || "Unknown";
+
+    const depositUsd = (Number(depositAmount) / 1_000_000).toFixed(2);
+    const quotedUsd = (Number(quotedAmount) / 1_000_000).toFixed(2);
+    const actualUsd = (Number(actualCost) / 1_000_000).toFixed(2);
+
+    console.log(`Escrow ID: ${escrowIdArg}`);
+    console.log(`Status: ${statusName}`);
+    console.log(`User: ${user}`);
+    console.log(`Deposit: $${depositUsd} USDC`);
+    console.log(`Quoted: $${quotedUsd} USDC`);
+
+    if (status === 2) { // Released
+      console.log(`Actual Cost: $${actualUsd} USDC`);
+      const refund = Number(depositAmount - actualCost) / 1_000_000;
+      console.log(`Refund: $${refund.toFixed(2)} USDC`);
+    }
+
+    if (akashDseq) {
+      console.log(`\nAkash Deployment:`);
+      console.log(`  DSEQ: ${akashDseq}`);
+      console.log(`  Provider: ${akashProvider}`);
+    }
+
+    console.log(`\nCreated: ${new Date(Number(createdAt) * 1000).toISOString()}`);
+
+  } catch (error) {
+    console.error("Failed to read escrow status:", error);
+    process.exit(1);
+  }
+}
+
+// ============================================================================
 // CLI ENTRY POINT
 // ============================================================================
 
@@ -436,19 +754,33 @@ if (command === "setup") {
     console.error("Status check failed:", error);
     process.exit(1);
   });
+} else if (command === "deposit") {
+  deposit(arg).catch((error) => {
+    console.error("Deposit failed:", error);
+    process.exit(1);
+  });
+} else if (command === "escrow-status") {
+  escrowStatus(arg).catch((error) => {
+    console.error("Escrow status check failed:", error);
+    process.exit(1);
+  });
 } else if (command === "--help" || command === "-h" || !command) {
   console.log(`
 Agent-Pay CLI
 
 Commands:
-  setup              Connect your wallet and configure agent-pay
-  approve <amount>   Approve USDC spending (e.g., approve 50 for $50)
-  status             Check your wallet balance and spending limit
+  setup                      Connect your wallet and configure agent-pay
+  approve <amount>           Approve USDC spending (e.g., approve 50 for $50)
+  status                     Check your wallet balance and spending limit
+  deposit <quoteId>          Deposit into escrow for a quote
+  escrow-status <escrowId>   Check escrow status on-chain
 
 Usage:
   npx @agent-pay/mcp setup
   npx @agent-pay/mcp approve 100
   npx @agent-pay/mcp status
+  npx @agent-pay/mcp deposit quote_abc123
+  npx @agent-pay/mcp escrow-status 0x...
 
 Environment variables:
   AGENT_PAY_GATEWAY_URL    Gateway URL (default: https://gateway.agentpay.dev)

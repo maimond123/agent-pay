@@ -155,7 +155,52 @@ export function registerProvisionCompute(
           selection.selectedQuoteId ?? quotes[0].quoteId;
         const chosenQuote = quotes.find((q) => q.quoteId === chosenQuoteId) ?? quotes[0];
 
-        // Step 4: Provision - gateway handles payment automatically via transferFrom
+        // Check if escrow is available
+        const escrowInfo = (chosenQuote as any).escrow;
+
+        if (escrowInfo) {
+          // ESCROW FLOW: Return quote with deposit instructions
+          const quotedUsd = (parseInt(escrowInfo.quotedAmount) / 1_000_000).toFixed(2);
+          const depositUsd = (parseInt(escrowInfo.suggestedDeposit) / 1_000_000).toFixed(2);
+          const refundEstimate = (parseFloat(depositUsd) - parseFloat(quotedUsd)).toFixed(2);
+
+          const text = [
+            `## Deployment Quote Ready`,
+            "",
+            `**Specs:** ${cpu} CPU, ${memory} RAM, ${storage} storage`,
+            `**Image:** ${image}`,
+            `**Duration:** ${hours} hours`,
+            `**Provider:** ${chosenQuote.providerName} (${chosenQuote.region})`,
+            "",
+            `**Cost:** $${quotedUsd} USDC`,
+            `**Deposit:** $${depositUsd} USDC (includes buffer)`,
+            `**Estimated Refund:** ~$${refundEstimate} USDC`,
+            "",
+            `### To deploy, run this command:`,
+            "",
+            "```",
+            `npx @agent-pay/mcp deposit ${chosenQuoteId}`,
+            "```",
+            "",
+            "This will:",
+            "1. Open your wallet to approve the deposit",
+            "2. Deposit funds into the escrow contract",
+            "3. Gateway will deploy your compute automatically",
+            "4. You'll get any unused funds back",
+            "",
+            "**Your Protections:**",
+            "- Funds held in escrow until deployment succeeds",
+            "- Full refund if deployment fails",
+            "- Excess funds automatically returned",
+            "- All transactions recorded on-chain",
+            "",
+            `Quote expires in 5 minutes.`,
+          ].join("\n");
+
+          return { content: [{ type: "text" as const, text }] };
+        }
+
+        // LEGACY FLOW: Direct provision (for backwards compatibility)
         const deployment = await gateway.provision({
           quoteId: chosenQuoteId,
           env: args.env,
@@ -167,7 +212,7 @@ export function registerProvisionCompute(
         const paymentInfo = (deployment as any).payment || {};
         const paymentTxHash = paymentInfo.txHash || "pending";
 
-        // Step 5: Poll for running status (up to 90s)
+        // Poll for running status (up to 90s)
         let status = await gateway.getDeploymentStatus(
           deployment.deploymentId,
         );

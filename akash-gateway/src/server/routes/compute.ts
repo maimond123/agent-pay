@@ -21,6 +21,7 @@ import {
 } from '../../db/store.js';
 import { getAkashClient } from '../../akash/client.js';
 import { getPaymentHandler } from '../../wallet/payment.js';
+import { getEscrowClient } from '../../escrow/client.js';
 import { createChildLogger } from '../logger.js';
 
 const logger = createChildLogger('compute-routes');
@@ -66,9 +67,24 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
     const paymentHandler = getPaymentHandler();
     const paymentDetails = paymentHandler.getPaymentConfig(pricing.totalUsdc);
 
+    // Compute specsHash for escrow matching
+    const escrowClient = getEscrowClient();
+    const specsHash = escrowClient.computeSpecsHash(
+      specs.cpu,
+      memoryMb,
+      storageMb,
+      specs.image,
+      specs.hours
+    );
+
+    // Calculate suggested deposit (quoted + 20% buffer, rounded up)
+    const quotedAmount = pricing.totalUsdc;
+    const suggestedDeposit = Math.ceil(parseInt(quotedAmount) * 1.2).toString();
+
     // Create quote
     const quote: ComputeQuote = {
       quoteId: generateQuoteId(),
+      specsHash,
       specs: {
         cpu: specs.cpu,
         memory: specs.memory,
@@ -90,6 +106,11 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
         recipient: paymentDetails.recipient,
         amount: paymentDetails.amount,
       },
+      escrow: escrowClient.isEnabled() ? {
+        contract: escrowClient.getEscrowAddress(),
+        quotedAmount,
+        suggestedDeposit,
+      } : undefined,
       validUntil: Date.now() + 5 * 60 * 1000, // 5 minutes
       createdAt: Date.now(),
     };
@@ -135,6 +156,16 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
     const memoryMb = parseToMb(specs.memory);
     const storageMb = parseToMb(specs.storage);
     const paymentHandler = getPaymentHandler();
+    const escrowClient = getEscrowClient();
+
+    // Compute specsHash for escrow matching
+    const specsHash = escrowClient.computeSpecsHash(
+      specs.cpu,
+      memoryMb,
+      storageMb,
+      specs.image,
+      specs.hours
+    );
 
     // Simulate multiple providers with different pricing
     const providers = [
@@ -155,9 +186,11 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
       // Apply provider-specific multiplier
       const adjustedTotal = Math.ceil(parseFloat(pricing.totalUsdc) * provider.multiplier);
       const priceUsd = (adjustedTotal / 1_000_000).toFixed(2);
+      const suggestedDeposit = Math.ceil(adjustedTotal * 1.2).toString();
 
       const quote: ComputeQuote = {
         quoteId: generateQuoteId(),
+        specsHash,
         specs: {
           cpu: specs.cpu,
           memory: specs.memory,
@@ -174,6 +207,11 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
           totalUsdc: adjustedTotal.toString(),
         },
         paymentDetails: paymentHandler.getPaymentConfig(adjustedTotal.toString()),
+        escrow: escrowClient.isEnabled() ? {
+          contract: escrowClient.getEscrowAddress(),
+          quotedAmount: adjustedTotal.toString(),
+          suggestedDeposit,
+        } : undefined,
         validUntil: Date.now() + 5 * 60 * 1000,
         createdAt: Date.now(),
       };
@@ -182,6 +220,7 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
 
       return {
         quoteId: quote.quoteId,
+        specsHash: quote.specsHash,
         provider: provider.id,
         providerName: provider.name,
         region: provider.region,
@@ -190,6 +229,7 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
         validUntil: quote.validUntil,
         capabilities: provider.capabilities,
         specs: quote.specs,
+        escrow: quote.escrow,
       };
     });
 
@@ -348,6 +388,36 @@ router.post('/provision', async (req: Request, res: Response, next: NextFunction
     };
 
     return res.status(202).json(response);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============================================================================
+// GET QUOTE BY ID - For CLI deposit command
+// ============================================================================
+
+router.get('/quote/:quoteId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { quoteId } = req.params;
+
+    const quote = getQuote(quoteId);
+    if (!quote) {
+      return res.status(404).json({
+        error: 'Quote not found',
+        message: 'The quote may have expired or been used. Please request a new quote.',
+      });
+    }
+
+    const validation = isQuoteValid(quoteId);
+    if (!validation.valid) {
+      return res.status(400).json({
+        error: 'Quote invalid',
+        reason: validation.reason,
+      });
+    }
+
+    return res.json(quote);
   } catch (error) {
     next(error);
   }
