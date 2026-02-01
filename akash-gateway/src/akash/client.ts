@@ -357,16 +357,8 @@ export class AkashClient {
     if (!sdk) throw new Error('SDK not loaded');
 
     try {
-      logger.info({ dseq }, 'Getting RPC connection for bid query');
-      const rpc = await sdk.getRpc(this.rpcEndpoint);
-      logger.info({ dseq }, 'RPC connection established');
-
-      // Import required modules
-      const Long = (await import('long')).default;
-      const marketQuery = await import('@akashnetwork/akashjs/build/protobuf/akash/market/v1beta4/query.js');
-
-      // Create query client
-      const queryClient = new marketQuery.QueryClientImpl(rpc);
+      // Use REST API (v1beta5) instead of broken protobuf SDK
+      const apiEndpoint = 'https://api.akashnet.net';
 
       // Poll for bids with timeout
       const startTime = Date.now();
@@ -374,30 +366,23 @@ export class AkashClient {
 
       while (Date.now() - startTime < timeout) {
         try {
-          // Query bids from chain
-          logger.info({ dseq, elapsed: Date.now() - startTime }, 'Querying for bids');
+          // Query bids from chain via REST API
+          logger.info({ dseq, elapsed: Date.now() - startTime }, 'Querying for bids via REST API');
 
-          const response = await queryClient.Bids({
-            $type: 'akash.market.v1beta4.QueryBidsRequest',
-            filters: {
-              $type: 'akash.market.v1beta4.BidFilters',
-              owner: this.address,
-              dseq: Long.fromString(dseq),
-              gseq: 0,
-              oseq: 0,
-              provider: '',
-              state: '',
-            },
-            pagination: undefined,
-          } as any);
+          const url = `${apiEndpoint}/akash/market/v1beta5/bids/list?filters.owner=${this.address}&filters.dseq=${dseq}`;
+          const res = await fetch(url);
+          if (!res.ok) {
+            throw new Error(`REST API error: ${res.status} ${res.statusText}`);
+          }
+          const response: any = await res.json();
 
           logger.info({ dseq, bidCount: response.bids?.length || 0 }, 'Bid query response');
 
           if (response.bids && response.bids.length > 0) {
-            return response.bids.map((bid: any) => ({
-              provider: bid.bid.bidId.provider,
-              price: bid.bid.price.amount,
-              attributes: bid.bid.state === 1 ? { state: 'open' } : { state: 'closed' },
+            return response.bids.map((bidResponse: any) => ({
+              provider: bidResponse.bid.id.provider,
+              price: bidResponse.bid.price.amount,
+              attributes: { state: bidResponse.bid.state },
             }));
           }
         } catch (e: any) {
@@ -487,6 +472,28 @@ export class AkashClient {
   }
 
   /**
+   * Get provider URI from chain
+   */
+  async getProviderUri(provider: string): Promise<string | null> {
+    try {
+      const apiEndpoint = 'https://api.akashnet.net';
+      const providerUrl = `${apiEndpoint}/akash/provider/v1beta4/providers/${provider}`;
+      const providerRes = await fetch(providerUrl);
+
+      if (!providerRes.ok) {
+        logger.warn({ provider, status: providerRes.status }, 'Failed to get provider info');
+        return null;
+      }
+
+      const providerData: any = await providerRes.json();
+      return providerData.provider?.host_uri || null;
+    } catch (error: any) {
+      logger.warn({ provider, error: error?.message }, 'Error fetching provider URI');
+      return null;
+    }
+  }
+
+  /**
    * Send manifest to provider via mTLS
    */
   async sendManifest(
@@ -505,16 +512,20 @@ export class AkashClient {
     if (!sdk) throw new Error('SDK not loaded');
 
     try {
-      // Get provider info
-      const rpc = await sdk.getRpc(this.rpcEndpoint);
-      const providerQuery = rpc.akash.provider.v1beta3 || rpc.akash.provider.v1beta4;
-      const providerResponse = await providerQuery.provider({ owner: provider });
+      // Get provider info via REST API (v1beta4)
+      const apiEndpoint = 'https://api.akashnet.net';
+      const providerUrl = `${apiEndpoint}/akash/provider/v1beta4/providers/${provider}`;
+      const providerRes = await fetch(providerUrl);
+      if (!providerRes.ok) {
+        throw new Error(`Failed to get provider info: ${providerRes.status}`);
+      }
+      const providerData: any = await providerRes.json();
 
-      if (!providerResponse.provider) {
+      if (!providerData.provider) {
         throw new Error(`Provider ${provider} not found`);
       }
 
-      const providerUri = providerResponse.provider.hostUri;
+      const providerUri = providerData.provider.host_uri;
       const sdl = sdk.SDL.fromString(sdlYaml, 'beta3');
       const manifest = sdl.manifestSortedJSON();
 
@@ -555,8 +566,11 @@ export class AkashClient {
       });
 
       logger.info({ dseq, provider }, 'Manifest sent to provider');
-    } catch (error) {
-      logger.error({ error }, 'Failed to send manifest');
+    } catch (error: any) {
+      logger.error({
+        error: error?.message || String(error),
+        stack: error?.stack
+      }, 'Failed to send manifest');
       throw error;
     }
   }
@@ -611,16 +625,20 @@ export class AkashClient {
     if (!sdk) throw new Error('SDK not loaded');
 
     try {
-      // Get provider URI
-      const rpc = await sdk.getRpc(this.rpcEndpoint);
-      const providerQuery = rpc.akash.provider.v1beta3 || rpc.akash.provider.v1beta4;
-      const providerResponse = await providerQuery.provider({ owner: provider });
+      // Get provider URI via REST API (v1beta4)
+      const apiEndpoint = 'https://api.akashnet.net';
+      const providerUrl = `${apiEndpoint}/akash/provider/v1beta4/providers/${provider}`;
+      const providerRes = await fetch(providerUrl);
+      if (!providerRes.ok) {
+        throw new Error(`Failed to get provider info: ${providerRes.status}`);
+      }
+      const providerData: any = await providerRes.json();
 
-      if (!providerResponse.provider) {
+      if (!providerData.provider) {
         throw new Error(`Provider ${provider} not found`);
       }
 
-      const providerUri = providerResponse.provider.hostUri;
+      const providerUri = providerData.provider.host_uri;
       const uri = new URL(providerUri);
 
       // Query lease status via mTLS
@@ -654,20 +672,33 @@ export class AkashClient {
             res.on('end', () => {
               try {
                 const status = JSON.parse(data);
+                logger.info({ rawStatus: JSON.stringify(status).substring(0, 1000) }, 'Raw lease status from provider');
+
+                // Parse services - Akash providers may use different field names
+                const services = Object.entries(status.services || {}).map(([name, svc]: [string, any]) => {
+                  // Try different field names for IPs/ports
+                  const ips = svc.ips || svc.forwarded_ports || [];
+                  const uris = svc.uris || svc.hostnames || [];
+
+                  logger.info({ serviceName: name, ipsCount: ips.length, urisCount: uris.length, svcKeys: Object.keys(svc) }, 'Parsing service');
+
+                  return {
+                    name,
+                    available: svc.available || svc.ready_replicas || 0,
+                    total: svc.total || svc.replicas || 0,
+                    uris,
+                    ips: ips.map((ip: any) => ({
+                      port: ip.port,
+                      externalPort: ip.externalPort || ip.external_port,
+                      protocol: ip.protocol || 'TCP',
+                      ip: ip.ip || ip.host,
+                    })),
+                  };
+                });
+
                 resolve({
                   state: 'active',
-                  services: Object.entries(status.services || {}).map(([name, svc]: [string, any]) => ({
-                    name,
-                    available: svc.available || 0,
-                    total: svc.total || 0,
-                    uris: svc.uris || [],
-                    ips: (svc.ips || []).map((ip: any) => ({
-                      port: ip.port,
-                      externalPort: ip.externalPort,
-                      protocol: ip.protocol,
-                      ip: ip.ip,
-                    })),
-                  })),
+                  services,
                 });
               } catch (e) {
                 reject(e);

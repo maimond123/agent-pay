@@ -54,10 +54,32 @@ export async function deployToAkashFromEscrow(
       throw new Error('No bids received from providers');
     }
 
-    // Select cheapest bid
-    const selectedBid = bids.sort((a, b) =>
-      parseInt(a.price) - parseInt(b.price)
-    )[0];
+    // Filter and select cheapest bid with valid provider URI
+    const sortedBids = bids.sort((a, b) => parseInt(a.price) - parseInt(b.price));
+
+    let selectedBid = null;
+    for (const bid of sortedBids) {
+      // Verify provider has a valid public hostname
+      const providerUri = await akash.getProviderUri(bid.provider);
+      if (!providerUri) {
+        logger.warn({ provider: bid.provider }, 'Provider has no host_uri, skipping');
+        continue;
+      }
+
+      // Skip providers with local/invalid hostnames
+      const hostname = new URL(providerUri).hostname;
+      if (hostname.endsWith('.local') || hostname === 'localhost' || hostname.startsWith('192.168.') || hostname.startsWith('10.')) {
+        logger.warn({ provider: bid.provider, hostname }, 'Provider has local/invalid hostname, skipping');
+        continue;
+      }
+
+      selectedBid = bid;
+      break;
+    }
+
+    if (!selectedBid) {
+      throw new Error('No providers with valid public hostnames found');
+    }
 
     logger.info({ deploymentId, provider: selectedBid.provider }, 'Provider selected');
 
@@ -102,6 +124,15 @@ export async function deployToAkashFromEscrow(
       // SUCCESS: Submit proof to escrow contract
       // This releases funds to gateway and refunds excess to user
       const actualCostUsdc = quote.pricing.totalUsdc; // Use quoted cost as actual cost
+      logger.info({
+        deploymentId,
+        escrowId,
+        dseq,
+        provider: selectedBid.provider,
+        actualCostUsdc,
+        quotePricing: quote.pricing
+      }, 'Submitting proof to escrow contract');
+
       const proofResult = await escrowClient.submitProof(
         escrowId,
         dseq,
@@ -121,8 +152,12 @@ export async function deployToAkashFromEscrow(
     } else {
       throw new Error(`Unexpected lease state: ${status.state}`);
     }
-  } catch (error) {
-    logger.error({ error, deploymentId }, 'Deployment failed');
+  } catch (error: any) {
+    logger.error({
+      error: error?.message || String(error),
+      stack: error?.stack,
+      deploymentId
+    }, 'Deployment failed');
     updateDeploymentStatus(deploymentId, 'failed');
 
     // FAILURE: Report failure to escrow contract

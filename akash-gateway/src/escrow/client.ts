@@ -45,7 +45,15 @@ export class EscrowClient {
     this.network = process.env.NETWORK || 'base-sepolia';
     this.chain = CHAINS[this.network as keyof typeof CHAINS] || baseSepolia;
     this.escrowAddress = (process.env.ESCROW_CONTRACT_ADDRESS || '0x0000000000000000000000000000000000000000') as Hex;
-    this.privateKey = (process.env.ESCROW_PRIVATE_KEY || null) as Hex | null;
+
+    // Normalize private key - add 0x prefix if missing
+    const rawPrivateKey = process.env.ESCROW_PRIVATE_KEY || null;
+    if (rawPrivateKey) {
+      this.privateKey = (rawPrivateKey.startsWith('0x') ? rawPrivateKey : `0x${rawPrivateKey}`) as Hex;
+    } else {
+      this.privateKey = null;
+    }
+
     this.mnemonic = process.env.ESCROW_MNEMONIC || null;
 
     if (this.escrowAddress === '0x0000000000000000000000000000000000000000') {
@@ -61,13 +69,22 @@ export class EscrowClient {
    * Get the account for signing transactions
    */
   private getAccount() {
-    if (this.mnemonic) {
-      return mnemonicToAccount(this.mnemonic);
+    try {
+      if (this.mnemonic) {
+        return mnemonicToAccount(this.mnemonic);
+      }
+      if (this.privateKey) {
+        return privateKeyToAccount(this.privateKey);
+      }
+      return null;
+    } catch (error: any) {
+      logger.error({
+        error: error?.message || String(error),
+        hasPrivateKey: !!this.privateKey,
+        hasMnemonic: !!this.mnemonic
+      }, 'Failed to create account from credentials');
+      return null;
     }
-    if (this.privateKey) {
-      return privateKeyToAccount(this.privateKey);
-    }
-    return null;
   }
 
   /**
@@ -165,6 +182,17 @@ export class EscrowClient {
     }
 
     try {
+      // Validate and convert actualCostUsdc
+      let costBigInt: bigint;
+      try {
+        // Remove any decimal points (USDC uses 6 decimals)
+        const costStr = String(actualCostUsdc).replace(/\./g, '');
+        costBigInt = BigInt(costStr || '0');
+        logger.info({ actualCostUsdc, costBigInt: costBigInt.toString() }, 'Converted cost to BigInt');
+      } catch (e: any) {
+        logger.error({ actualCostUsdc, error: e?.message }, 'Failed to convert actualCostUsdc to BigInt');
+        return { success: false, error: `Invalid actualCostUsdc: ${actualCostUsdc}` };
+      }
 
       const publicClient = createPublicClient({
         chain: this.chain,
@@ -177,13 +205,13 @@ export class EscrowClient {
         transport: http(),
       });
 
-      logger.info({ escrowId, akashDseq, akashProvider, actualCostUsdc }, 'Submitting proof to escrow');
+      logger.info({ escrowId, akashDseq, akashProvider, actualCostUsdc, costBigInt: costBigInt.toString() }, 'Submitting proof to escrow');
 
       const txHash = await walletClient.writeContract({
         address: this.escrowAddress,
         abi: ESCROW_ABI,
         functionName: 'submitProof',
-        args: [escrowId, akashDseq, akashProvider, BigInt(actualCostUsdc)],
+        args: [escrowId, akashDseq, akashProvider, costBigInt],
       });
 
       logger.info({ txHash, escrowId }, 'Proof submitted, waiting for confirmation');
