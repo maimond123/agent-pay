@@ -361,6 +361,13 @@ export class AkashClient {
       const rpc = await sdk.getRpc(this.rpcEndpoint);
       logger.info({ dseq }, 'RPC connection established');
 
+      // Import required modules
+      const Long = (await import('long')).default;
+      const marketQuery = await import('@akashnetwork/akashjs/build/protobuf/akash/market/v1beta4/query.js');
+
+      // Create query client
+      const queryClient = new marketQuery.QueryClientImpl(rpc);
+
       // Poll for bids with timeout
       const startTime = Date.now();
       const timeout = 5 * 60 * 1000; // 5 minutes
@@ -369,13 +376,20 @@ export class AkashClient {
         try {
           // Query bids from chain
           logger.info({ dseq, elapsed: Date.now() - startTime }, 'Querying for bids');
-          const queryClient = rpc.akash.market.v1beta4 || rpc.akash.market.v1beta3;
-          const response = await queryClient.bids({
+
+          const response = await queryClient.Bids({
+            $type: 'akash.market.v1beta4.QueryBidsRequest',
             filters: {
+              $type: 'akash.market.v1beta4.BidFilters',
               owner: this.address,
-              dseq: dseq,
+              dseq: Long.fromString(dseq),
+              gseq: 0,
+              oseq: 0,
+              provider: '',
+              state: '',
             },
-          });
+            pagination: undefined,
+          } as any);
 
           logger.info({ dseq, bidCount: response.bids?.length || 0 }, 'Bid query response');
 
@@ -386,8 +400,12 @@ export class AkashClient {
               attributes: bid.bid.state === 1 ? { state: 'open' } : { state: 'closed' },
             }));
           }
-        } catch (e) {
-          logger.warn({ error: e, dseq }, 'Bid query attempt failed, retrying...');
+        } catch (e: any) {
+          logger.warn({
+            error: e?.message || String(e),
+            stack: e?.stack,
+            dseq
+          }, 'Bid query attempt failed, retrying...');
         }
 
         // Wait before next poll
