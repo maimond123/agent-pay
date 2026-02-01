@@ -49,6 +49,11 @@ export function generateSdl(config: AkashDeploymentConfig): string {
               nvidia:`
     : '';
 
+  // Build env section properly
+  const envSection = Object.keys(env).length > 0
+    ? `    env:\n${envLines}`
+    : '';
+
   const sdl = `---
 version: "2.0"
 
@@ -56,8 +61,7 @@ services:
   app:
     image: ${image}
 ${commandSection}
-    env:
-${envLines || '        []'}
+${envSection}
     expose:
 ${exposeLines}
 
@@ -77,7 +81,7 @@ profiles:
       pricing:
         app:
           denom: uakt
-          amount: 10000
+          amount: 100000
 
 deployment:
   app:

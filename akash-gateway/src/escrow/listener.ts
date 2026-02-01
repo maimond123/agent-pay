@@ -3,7 +3,7 @@ import { base, baseSepolia } from 'viem/chains';
 import { ESCROW_ABI } from './abi.js';
 import { getEscrowClient } from './client.js';
 import { createChildLogger } from '../server/logger.js';
-import { getQuoteBySpecsHash, createDeploymentFromEscrow, updateDeploymentStatus, setPaymentTxHash } from '../db/store.js';
+import { getQuoteBySpecsHash, createDeploymentFromEscrow, updateDeploymentStatus, setPaymentTxHash, getDeploymentByEscrowId as getByEscrowId } from '../db/store.js';
 import { deployToAkashFromEscrow } from './deploy-handler.js';
 
 const logger = createChildLogger('escrow-listener');
@@ -16,6 +16,10 @@ const CHAINS = {
 const DEPOSITED_EVENT = parseAbiItem(
   'event Deposited(bytes32 indexed escrowId, address indexed user, uint256 amount, bytes32 specsHash)'
 );
+
+// Store client reference for manual polling
+let storedClient: any = null;
+let storedEscrowAddress: Hex | null = null;
 
 /**
  * Start listening for Deposited events on the escrow contract
@@ -39,36 +43,57 @@ export function startEscrowListener(): void {
     transport: http(),
   });
 
-  // Watch for Deposited events
-  const unwatch = client.watchEvent({
-    address: escrowAddress,
-    event: DEPOSITED_EVENT,
-    onLogs: async (logs) => {
-      for (const log of logs) {
-        await handleDepositedEvent(log);
+  // Store for manual polling
+  storedClient = client;
+  storedEscrowAddress = escrowAddress;
+
+  // Track last processed block to avoid duplicates
+  let lastProcessedBlock = 0n;
+
+  // Poll for events every 5 seconds (public RPCs don't support watchEvent filters)
+  const pollInterval = setInterval(async () => {
+    try {
+      const currentBlock = await client.getBlockNumber();
+      const fromBlock = lastProcessedBlock > 0n ? lastProcessedBlock + 1n : (currentBlock > 50n ? currentBlock - 50n : 0n);
+
+      if (fromBlock > currentBlock) return;
+
+      const logs = await client.getLogs({
+        address: escrowAddress,
+        event: DEPOSITED_EVENT,
+        fromBlock,
+        toBlock: currentBlock,
+      });
+
+      if (logs.length > 0) {
+        logger.info({ count: logs.length, fromBlock, toBlock: currentBlock }, 'Found new deposit events');
+        for (const log of logs) {
+          await handleDepositedEvent(log);
+        }
       }
-    },
-    onError: (error) => {
-      logger.error({ error }, 'Error watching Deposited events');
-    },
-  });
+
+      lastProcessedBlock = currentBlock;
+    } catch (error) {
+      logger.error({ error }, 'Error polling for Deposited events');
+    }
+  }, 5000);
 
   // Also poll for recent events on startup (in case we missed any)
   pollRecentDeposits(client, escrowAddress);
 
-  logger.info('Escrow event listener started');
+  logger.info('Escrow event listener started (polling mode)');
 
-  // Return unwatch function for cleanup
+  // Cleanup on shutdown
   process.on('SIGTERM', () => {
     logger.info('Stopping escrow listener');
-    unwatch();
+    clearInterval(pollInterval);
   });
 }
 
 /**
  * Poll for recent Deposited events (last 100 blocks)
  */
-async function pollRecentDeposits(client: ReturnType<typeof createPublicClient>, escrowAddress: Hex): Promise<void> {
+async function pollRecentDeposits(client: any, escrowAddress: Hex): Promise<void> {
   try {
     const currentBlock = await client.getBlockNumber();
     const fromBlock = currentBlock > 100n ? currentBlock - 100n : 0n;
@@ -141,7 +166,47 @@ async function handleDepositedEvent(log: any): Promise<void> {
  * Check if deployment already exists for this escrow
  */
 function getDeploymentByEscrowId(escrowId: Hex): any {
-  // This will be implemented in store.ts
-  const { getDeploymentByEscrowId: getByEscrow } = require('../db/store.js');
-  return getByEscrow?.(escrowId);
+  return getByEscrowId(escrowId);
+}
+
+/**
+ * Manually trigger polling for recent deposits
+ */
+export async function manualPollDeposits(): Promise<{ success: boolean; count?: number; events?: any[]; error?: string }> {
+  if (!storedClient || !storedEscrowAddress) {
+    return { success: false, error: 'Escrow listener not initialized' };
+  }
+
+  try {
+    const currentBlock = await storedClient.getBlockNumber();
+    const fromBlock = currentBlock > 500n ? currentBlock - 500n : 0n;
+
+    logger.info({ fromBlock, toBlock: currentBlock }, 'Manual polling for deposits');
+
+    const logs = await storedClient.getLogs({
+      address: storedEscrowAddress,
+      event: DEPOSITED_EVENT,
+      fromBlock,
+      toBlock: currentBlock,
+    });
+
+    logger.info({ count: logs.length }, 'Manual poll found deposit events');
+
+    const eventDetails = logs.map((log: any) => ({
+      escrowId: log.args.escrowId,
+      user: log.args.user,
+      amount: log.args.amount?.toString(),
+      specsHash: log.args.specsHash,
+      txHash: log.transactionHash,
+    }));
+
+    for (const log of logs) {
+      await handleDepositedEvent(log);
+    }
+
+    return { success: true, count: logs.length, events: eventDetails };
+  } catch (error: any) {
+    logger.error({ error }, 'Manual poll failed');
+    return { success: false, error: error.message };
+  }
 }

@@ -357,7 +357,9 @@ export class AkashClient {
     if (!sdk) throw new Error('SDK not loaded');
 
     try {
+      logger.info({ dseq }, 'Getting RPC connection for bid query');
       const rpc = await sdk.getRpc(this.rpcEndpoint);
+      logger.info({ dseq }, 'RPC connection established');
 
       // Poll for bids with timeout
       const startTime = Date.now();
@@ -366,6 +368,7 @@ export class AkashClient {
       while (Date.now() - startTime < timeout) {
         try {
           // Query bids from chain
+          logger.info({ dseq, elapsed: Date.now() - startTime }, 'Querying for bids');
           const queryClient = rpc.akash.market.v1beta4 || rpc.akash.market.v1beta3;
           const response = await queryClient.bids({
             filters: {
@@ -373,6 +376,8 @@ export class AkashClient {
               dseq: dseq,
             },
           });
+
+          logger.info({ dseq, bidCount: response.bids?.length || 0 }, 'Bid query response');
 
           if (response.bids && response.bids.length > 0) {
             return response.bids.map((bid: any) => ({
@@ -382,7 +387,7 @@ export class AkashClient {
             }));
           }
         } catch (e) {
-          logger.debug({ error: e }, 'Bid query attempt failed, retrying...');
+          logger.warn({ error: e, dseq }, 'Bid query attempt failed, retrying...');
         }
 
         // Wait before next poll

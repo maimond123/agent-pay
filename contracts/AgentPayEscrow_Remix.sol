@@ -5,7 +5,7 @@ pragma solidity ^0.8.20;
 // REMIX-READY: Copy this entire file to Remix and deploy
 // Constructor args for Base mainnet:
 //   _usdc: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-//   _gateway: <your gateway wallet address>
+//   _gateway: 0xD526BF202e4C46333d5CbA8b7228a92c8257795F
 // ============================================================================
 
 interface IERC20 {

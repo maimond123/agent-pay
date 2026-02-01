@@ -51,3 +51,10 @@ temp/
 # CRE build artifacts
 agent-*/bin/
 *.wasm.gz
+
+# Foundry (Solidity) artifacts
+contracts/lib/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/.env.deploy

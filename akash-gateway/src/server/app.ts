@@ -7,6 +7,7 @@ import { logger } from './logger.js';
 import { getStats } from '../db/store.js';
 import { verifyToken } from '../db/tokens.js';
 import { getEscrowClient } from '../escrow/client.js';
+import { manualPollDeposits } from '../escrow/listener.js';
 
 // ============================================================================
 // EXPRESS APP SETUP
@@ -100,6 +101,12 @@ export function createApp() {
       version: '2.0.0',
       stats,
     });
+  });
+
+  // Manual poll for deposits (admin endpoint)
+  app.post('/admin/poll-deposits', async (req: Request, res: Response) => {
+    const result = await manualPollDeposits();
+    res.json(result);
   });
 
   // API info (public)

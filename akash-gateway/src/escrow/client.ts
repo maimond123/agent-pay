@@ -7,7 +7,7 @@ import {
   parseAbiParameters,
   type Hex,
 } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { privateKeyToAccount, mnemonicToAccount } from 'viem/accounts';
 import { base, baseSepolia } from 'viem/chains';
 import { ESCROW_ABI, EscrowStatus, escrowStatusToString } from './abi.js';
 import { createChildLogger } from '../server/logger.js';
@@ -39,16 +39,35 @@ export class EscrowClient {
   private readonly chain: typeof base | typeof baseSepolia;
   private readonly escrowAddress: Hex;
   private readonly privateKey: Hex | null;
+  private readonly mnemonic: string | null;
 
   constructor() {
     this.network = process.env.NETWORK || 'base-sepolia';
     this.chain = CHAINS[this.network as keyof typeof CHAINS] || baseSepolia;
     this.escrowAddress = (process.env.ESCROW_CONTRACT_ADDRESS || '0x0000000000000000000000000000000000000000') as Hex;
-    this.privateKey = (process.env.ESCROW_PRIVATE_KEY || process.env.PAYMENT_RECEIVER_PRIVATE_KEY || null) as Hex | null;
+    this.privateKey = (process.env.ESCROW_PRIVATE_KEY || null) as Hex | null;
+    this.mnemonic = process.env.ESCROW_MNEMONIC || null;
 
     if (this.escrowAddress === '0x0000000000000000000000000000000000000000') {
       logger.warn('ESCROW_CONTRACT_ADDRESS not set - escrow features disabled');
     }
+
+    if (!this.privateKey && !this.mnemonic) {
+      logger.warn('No ESCROW_PRIVATE_KEY or ESCROW_MNEMONIC set - cannot submit proofs');
+    }
+  }
+
+  /**
+   * Get the account for signing transactions
+   */
+  private getAccount() {
+    if (this.mnemonic) {
+      return mnemonicToAccount(this.mnemonic);
+    }
+    if (this.privateKey) {
+      return privateKeyToAccount(this.privateKey);
+    }
+    return null;
   }
 
   /**
@@ -140,12 +159,12 @@ export class EscrowClient {
       return { success: false, error: 'Escrow not enabled' };
     }
 
-    if (!this.privateKey) {
-      return { success: false, error: 'Gateway private key not configured' };
+    const account = this.getAccount();
+    if (!account) {
+      return { success: false, error: 'Gateway credentials not configured (need ESCROW_PRIVATE_KEY or ESCROW_MNEMONIC)' };
     }
 
     try {
-      const account = privateKeyToAccount(this.privateKey);
 
       const publicClient = createPublicClient({
         chain: this.chain,
@@ -200,12 +219,12 @@ export class EscrowClient {
       return { success: false, error: 'Escrow not enabled' };
     }
 
-    if (!this.privateKey) {
-      return { success: false, error: 'Gateway private key not configured' };
+    const account = this.getAccount();
+    if (!account) {
+      return { success: false, error: 'Gateway credentials not configured (need ESCROW_PRIVATE_KEY or ESCROW_MNEMONIC)' };
     }
 
     try {
-      const account = privateKeyToAccount(this.privateKey);
 
       const publicClient = createPublicClient({
         chain: this.chain,
