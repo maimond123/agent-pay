@@ -543,8 +543,13 @@ router.post('/:deploymentId/close', async (req: Request, res: Response, next: Ne
         const akash = getAkashClient();
         await akash.closeDeployment(deployment.akash.dseq);
         logger.info({ deploymentId, dseq: deployment.akash.dseq }, 'Akash deployment closed');
-      } catch (error) {
-        logger.error({ error, deploymentId }, 'Failed to close Akash deployment, marking as stopped anyway');
+      } catch (error: any) {
+        logger.error({
+          error: error?.message || String(error),
+          stack: error?.stack,
+          deploymentId,
+          dseq: deployment.akash.dseq,
+        }, 'Failed to close Akash deployment, marking as stopped anyway');
       }
     }
 

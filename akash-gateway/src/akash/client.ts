@@ -70,8 +70,11 @@ async function loadAkashSdk() {
 
     logger.info('Akash SDK loaded successfully');
     return akashSdk;
-  } catch (error) {
-    logger.error({ error }, 'Failed to load Akash SDK - running in mock mode');
+  } catch (error: any) {
+    logger.error({
+      error: error?.message || String(error),
+      stack: error?.stack,
+    }, 'Failed to load Akash SDK - running in mock mode');
     return null;
   }
 }
@@ -723,8 +726,13 @@ export class AkashClient {
         req.on('error', reject);
         req.end();
       });
-    } catch (error) {
-      logger.error({ error }, 'Failed to get lease status');
+    } catch (error: any) {
+      logger.error({
+        error: error?.message || String(error),
+        stack: error?.stack,
+        dseq,
+        provider,
+      }, 'Failed to get lease status');
       throw error;
     }
   }
@@ -756,8 +764,8 @@ export class AkashClient {
       };
 
       const fee = {
-        amount: [{ denom: 'uakt', amount: '20000' }],
-        gas: '800000',
+        amount: [{ denom: 'uakt', amount: '25000' }],
+        gas: '1000000',
       };
 
       const tx = await this.client.signAndBroadcast(
@@ -773,8 +781,12 @@ export class AkashClient {
 
       logger.info({ dseq, txHash: tx.transactionHash }, 'Deployment closed');
       return { txHash: tx.transactionHash };
-    } catch (error) {
-      logger.error({ error }, 'Failed to close deployment');
+    } catch (error: any) {
+      logger.error({
+        error: error?.message || String(error),
+        stack: error?.stack,
+        dseq,
+      }, 'Failed to close deployment');
       throw error;
     }
   }
