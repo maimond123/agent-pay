@@ -32,6 +32,8 @@ export interface QuoteRequest {
     model?: string;
   };
   ports?: PortConfig[];
+  env?: Record<string, string>;
+  command?: string[];
 }
 
 export interface QuotePricing {

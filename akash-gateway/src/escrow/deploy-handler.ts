@@ -43,6 +43,8 @@ export async function deployToAkashFromEscrow(
       image: quote.specs.image,
       ports: deployPorts,
       gpu: quote.specs.gpu,
+      env: quote.specs.env,
+      command: quote.specs.command,
     });
 
     logger.info({ deploymentId, dseq, txHash }, 'Akash deployment created');
@@ -104,6 +106,8 @@ export async function deployToAkashFromEscrow(
       image: quote.specs.image,
       ports: deployPorts,
       gpu: quote.specs.gpu,
+      env: quote.specs.env,
+      command: quote.specs.command,
     });
 
     // Wait for deployment to be ready

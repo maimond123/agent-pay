@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { DirectSecp256k1HdWallet, Registry } from '@cosmjs/proto-signing';
-import { SigningStargateClient } from '@cosmjs/stargate';
+import { SigningStargateClient, GasPrice } from '@cosmjs/stargate';
 import { generateSdl, validateSdlConfig } from './sdl.js';
 import { createChildLogger } from '../server/logger.js';
 import type { AkashDeploymentConfig } from '../types/index.js';
@@ -144,12 +144,13 @@ export class AkashClient {
       // Get Akash type registry
       const registry = sdk.getAkashTypeRegistry();
 
-      // Connect to RPC with Akash registry
+      // Connect to RPC with Akash registry and gas price for auto gas estimation
       this.client = await SigningStargateClient.connectWithSigner(
         this.rpcEndpoint,
         this.wallet,
         {
           registry: new Registry(registry),
+          gasPrice: GasPrice.fromString("0.025uakt"),
         }
       );
 
@@ -321,8 +322,11 @@ export class AkashClient {
         dseq: deployment.id.dseq,
         txHash: tx.transactionHash,
       };
-    } catch (error) {
-      logger.error({ error }, 'Failed to create deployment');
+    } catch (error: any) {
+      logger.error({
+        error: error?.message || String(error),
+        stack: error?.stack,
+      }, 'Failed to create deployment');
       throw error;
     }
   }

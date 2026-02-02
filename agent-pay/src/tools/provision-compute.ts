@@ -155,6 +155,8 @@ export function registerProvisionCompute(
           hours,
           gpu: args.gpu,
           ports: args.ports,
+          env: args.env,
+          command: args.command,
         };
         const { quotes } = await gateway.getMultiQuotes(quoteReq);
 

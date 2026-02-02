@@ -94,6 +94,8 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
         hours: specs.hours,
         gpu: specs.gpu,
         ports: specs.ports,
+        env: specs.env,
+        command: specs.command,
       },
       pricing: {
         akashCostUakt: pricing.akashCostUakt.toString(),
@@ -201,6 +203,8 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
           hours: specs.hours,
           gpu: specs.gpu,
           ports: specs.ports,
+          env: specs.env,
+          command: specs.command,
         },
         pricing: {
           akashCostUakt: pricing.akashCostUakt.toString(),

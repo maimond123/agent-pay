@@ -20,6 +20,8 @@ export const ComputeQuoteRequestSchema = z.object({
     protocol: z.enum(['tcp', 'udp']).default('tcp'),
     expose: z.boolean().default(true),
   })).optional(),
+  env: z.record(z.string()).optional(),
+  command: z.array(z.string()).optional(),
 });
 
 export const ComputeProvisionRequestSchema = z.object({
@@ -70,6 +72,8 @@ export interface ComputeQuote {
       protocol: 'tcp' | 'udp';
       expose: boolean;
     }>;
+    env?: Record<string, string>;
+    command?: string[];
   };
   pricing: {
     akashCostUakt: string;
