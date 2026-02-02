@@ -639,9 +639,20 @@ async function deposit(quoteIdArg?: string) {
     console.log("Tracking deployment status...\n");
 
     const pollTimeout = 120000; // 2 minutes
-    const pollInterval = 3000; // 3 seconds
+    const pollInterval = 2000; // 2 seconds for more responsive updates
     const startTime = Date.now();
-    let lastStatus = "";
+
+    // Track what we've already printed to avoid duplicates
+    let printedDeposit = false;
+    let printedDeploymentId = false;
+    let printedDseq = false;
+    let printedWaitingBids = false;
+    let printedProvider = false;
+    let printedLease = false;
+    let printedManifest = false;
+    let lastDseq = "";
+    let lastProvider = "";
+    let lastLeaseId = "";
 
     while (Date.now() - startTime < pollTimeout) {
       try {
@@ -671,65 +682,98 @@ async function deposit(quoteIdArg?: string) {
         };
 
         if (result.status === "awaiting_deposit") {
-          process.stdout.write(".");
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          process.stdout.write(`\r  Waiting for deposit confirmation... (${elapsed}s)`);
           await new Promise((resolve) => setTimeout(resolve, pollInterval));
           continue;
         }
 
         if (result.status === "deployment_found" && result.deployment) {
           const deployment = result.deployment;
-          const currentStatus = deployment.status;
+          const akash = deployment.akash || {};
 
-          // Log status changes
-          if (currentStatus !== lastStatus) {
-            lastStatus = currentStatus;
-            console.log(""); // New line after dots
+          // Print deposit detected
+          if (!printedDeposit) {
+            console.log("\n");
+            console.log("  ✓ Deposit confirmed on-chain");
+            printedDeposit = true;
+          }
 
-            if (currentStatus === "pending") {
-              console.log("  ✓ Deposit detected - creating deployment...");
-            } else if (currentStatus === "deploying") {
-              console.log("  ✓ Deploying to Akash Network...");
-              if (deployment.akash?.dseq) {
-                console.log(`    Akash dseq: ${deployment.akash.dseq}`);
-              }
-              if (deployment.akash?.provider) {
-                console.log(`    Provider: ${deployment.akash.provider.slice(0, 30)}...`);
-              }
-            }
+          // Print deployment ID
+          if (!printedDeploymentId && deployment.deploymentId) {
+            console.log(`  ✓ Deployment created: ${deployment.deploymentId}`);
+            printedDeploymentId = true;
+          }
+
+          // Print dseq when it appears
+          if (!printedDseq && akash.dseq && akash.dseq !== lastDseq) {
+            console.log(`  ✓ Akash deployment broadcasted (dseq: ${akash.dseq})`);
+            printedDseq = true;
+            lastDseq = akash.dseq;
+          }
+
+          // Print waiting for bids
+          if (printedDseq && !printedProvider && !printedWaitingBids) {
+            console.log(`  ⏳ Waiting for provider bids...`);
+            printedWaitingBids = true;
+          }
+
+          // Print provider selected
+          if (!printedProvider && akash.provider && akash.provider !== lastProvider) {
+            console.log(`  ✓ Provider selected: ${akash.provider}`);
+            printedProvider = true;
+            lastProvider = akash.provider;
+          }
+
+          // Print lease created
+          if (!printedLease && akash.leaseId && akash.leaseId !== lastLeaseId) {
+            console.log(`  ✓ Lease created with provider`);
+            printedLease = true;
+            lastLeaseId = akash.leaseId;
+          }
+
+          // Print manifest sent (infer from having lease but not yet running)
+          if (printedLease && !printedManifest && deployment.status === "deploying") {
+            console.log(`  ⏳ Sending manifest & starting container...`);
+            printedManifest = true;
           }
 
           // Check for terminal states
-          if (currentStatus === "running") {
-            console.log("  ✓ Container is RUNNING!\n");
+          if (deployment.status === "running") {
+            console.log("  ✓ Container is RUNNING!");
+
+            if (deployment.escrowProofTx) {
+              console.log(`  ✓ Escrow proof submitted - funds released`);
+            }
 
             const endpointLines = deployment.endpoints && deployment.endpoints.length > 0
               ? deployment.endpoints.map(ep => `    ${ep.protocol}://${ep.host}:${ep.port}`).join("\n")
-              : "    (still provisioning - check Claude for updates)";
+              : "    (endpoints still provisioning - check status again)";
 
             console.log(`
+
 ╔═══════════════════════════════════════════════════════════════╗
 ║                  Deployment Complete!                         ║
 ╚═══════════════════════════════════════════════════════════════╝
 
   Deployment ID: ${deployment.deploymentId}
-  Status: ${deployment.status}
-  Akash dseq: ${deployment.akash?.dseq || "N/A"}
+  Akash dseq:    ${akash.dseq || "N/A"}
+  Provider:      ${akash.provider || "N/A"}
 
   Endpoints:
 ${endpointLines}
 
   Expires: ${new Date(deployment.expiresAt).toISOString()}
-${deployment.escrowProofTx ? `  Escrow proof tx: ${deployment.escrowProofTx}` : ""}
-
-  You can also check status in Claude Code!
+${deployment.escrowProofTx ? `\n  Escrow tx: ${deployment.escrowProofTx}` : ""}
 `);
             process.exit(0);
           }
 
-          if (currentStatus === "failed") {
-            console.log("  ✗ Deployment FAILED\n");
+          if (deployment.status === "failed") {
+            console.log("  ✗ Deployment FAILED");
 
             console.log(`
+
 ╔═══════════════════════════════════════════════════════════════╗
 ║                  Deployment Failed                            ║
 ╚═══════════════════════════════════════════════════════════════╝

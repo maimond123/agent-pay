@@ -674,23 +674,36 @@ export class AkashClient {
                 const status = JSON.parse(data);
                 logger.info({ rawStatus: JSON.stringify(status).substring(0, 1000) }, 'Raw lease status from provider');
 
+                // Get top-level forwarded_ports (keyed by service name)
+                const topLevelForwardedPorts = status.forwarded_ports || {};
+                const topLevelIps = status.ips || {};
+
                 // Parse services - Akash providers may use different field names
                 const services = Object.entries(status.services || {}).map(([name, svc]: [string, any]) => {
-                  // Try different field names for IPs/ports
-                  const ips = svc.ips || svc.forwarded_ports || [];
+                  // Try different sources for IPs/ports:
+                  // 1. Top-level forwarded_ports[serviceName]
+                  // 2. Service-level ips/forwarded_ports
+                  // 3. Top-level ips[serviceName]
+                  const forwardedPorts = topLevelForwardedPorts[name] || svc.forwarded_ports || svc.ips || topLevelIps[name] || [];
                   const uris = svc.uris || svc.hostnames || [];
 
-                  logger.info({ serviceName: name, ipsCount: ips.length, urisCount: uris.length, svcKeys: Object.keys(svc) }, 'Parsing service');
+                  logger.info({
+                    serviceName: name,
+                    forwardedPortsCount: forwardedPorts.length,
+                    urisCount: uris.length,
+                    svcKeys: Object.keys(svc),
+                    hasTopLevelPorts: !!topLevelForwardedPorts[name],
+                  }, 'Parsing service');
 
                   return {
                     name,
                     available: svc.available || svc.ready_replicas || 0,
                     total: svc.total || svc.replicas || 0,
                     uris,
-                    ips: ips.map((ip: any) => ({
+                    ips: forwardedPorts.map((ip: any) => ({
                       port: ip.port,
                       externalPort: ip.externalPort || ip.external_port,
-                      protocol: ip.protocol || 'TCP',
+                      protocol: ip.protocol || ip.proto || 'TCP',
                       ip: ip.ip || ip.host,
                     })),
                   };
