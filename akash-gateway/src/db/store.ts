@@ -275,6 +275,18 @@ export function getDeploymentByEscrowId(escrowId: Hex): DeploymentInfo | undefin
 }
 
 /**
+ * Get deployment by quote ID
+ */
+export function getDeploymentByQuoteId(quoteId: string): DeploymentInfo | undefined {
+  for (const deployment of deployments.values()) {
+    if (deployment.quoteId === quoteId) {
+      return deployment;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Set escrow proof/failure transaction hash
  */
 export function setEscrowProofTx(

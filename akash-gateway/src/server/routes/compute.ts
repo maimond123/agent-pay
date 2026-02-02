@@ -13,6 +13,7 @@ import {
   markQuoteUsed,
   createDeployment,
   getDeployment,
+  getDeploymentByQuoteId,
   updateDeploymentStatus,
   setDeploymentEndpoints,
   setPaymentTxHash,
@@ -92,6 +93,7 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
         image: specs.image,
         hours: specs.hours,
         gpu: specs.gpu,
+        ports: specs.ports,
       },
       pricing: {
         akashCostUakt: pricing.akashCostUakt.toString(),
@@ -198,6 +200,7 @@ router.post('/quotes', async (req: Request, res: Response, next: NextFunction) =
           image: specs.image,
           hours: specs.hours,
           gpu: specs.gpu,
+          ports: specs.ports,
         },
         pricing: {
           akashCostUakt: pricing.akashCostUakt.toString(),
@@ -424,6 +427,44 @@ router.get('/quote/:quoteId', async (req: Request, res: Response, next: NextFunc
 });
 
 // ============================================================================
+// GET DEPLOYMENT BY QUOTE ID - For tracking escrow deposits
+// ============================================================================
+
+router.get('/by-quote/:quoteId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { quoteId } = req.params;
+
+    // First check if quote exists
+    const quote = getQuote(quoteId);
+    if (!quote) {
+      return res.status(404).json({
+        error: 'Quote not found',
+        status: 'not_found',
+      });
+    }
+
+    // Check if a deployment was created for this quote
+    const deployment = getDeploymentByQuoteId(quoteId);
+    if (!deployment) {
+      // Quote exists but no deployment yet - user hasn't deposited
+      return res.json({
+        status: 'awaiting_deposit',
+        quoteId,
+        message: 'Waiting for escrow deposit. Once you deposit, deployment will start automatically.',
+      });
+    }
+
+    // Deployment exists - return full status
+    return res.json({
+      status: 'deployment_found',
+      deployment,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============================================================================
 // STATUS ENDPOINT - Get deployment status
 // ============================================================================
 
@@ -550,6 +591,9 @@ async function deployToAkash(
   // Update status to deploying
   updateDeploymentStatus(deploymentId, 'deploying');
 
+  // Determine ports: options > quote.specs > default
+  const deployPorts = options.ports || quote.specs.ports || [{ port: 22, protocol: 'tcp' as const, expose: true }];
+
   try {
     // Create deployment on Akash
     const { dseq, txHash } = await akash.createDeployment({
@@ -559,7 +603,7 @@ async function deployToAkash(
       image: quote.specs.image,
       env: options.env,
       command: options.command,
-      ports: options.ports || [{ port: 80, protocol: 'tcp', expose: true }],
+      ports: deployPorts,
       gpu: quote.specs.gpu,
     });
 
@@ -600,7 +644,7 @@ async function deployToAkash(
       image: quote.specs.image,
       env: options.env,
       command: options.command,
-      ports: options.ports || [{ port: 80, protocol: 'tcp', expose: true }],
+      ports: deployPorts,
       gpu: quote.specs.gpu,
     });
 
@@ -612,11 +656,23 @@ async function deployToAkash(
 
     if (status.state === 'active' && status.services.length > 0) {
       const service = status.services[0];
-      const endpoints = service.ips.map(ip => ({
+
+      // Extract endpoints from IPs
+      let endpoints = service.ips.map(ip => ({
         host: ip.ip || service.uris[0],
         port: ip.externalPort,
         protocol: ip.protocol.toLowerCase(),
       }));
+
+      // Fallback: if no IPs but URIs exist, use URIs as endpoints
+      if (endpoints.length === 0 && service.uris && service.uris.length > 0) {
+        endpoints = service.uris.map(uri => ({
+          host: uri,
+          port: deployPorts[0]?.port || 80,
+          protocol: 'tcp',
+        }));
+        logger.info({ deploymentId, uris: service.uris }, 'Using URIs as endpoints (no IPs available)');
+      }
 
       setDeploymentEndpoints(deploymentId, endpoints);
       updateDeploymentStatus(deploymentId, 'running');

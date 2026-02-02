@@ -8,6 +8,7 @@ import { registerGetComputeQuote } from "./tools/get-compute-quote.js";
 import { registerCheckDeployment } from "./tools/check-deployment.js";
 import { registerListDeployments } from "./tools/list-deployments.js";
 import { registerStopDeployment } from "./tools/stop-deployment.js";
+import { registerWatchEscrowDeployment } from "./tools/watch-escrow-deployment.js";
 
 // Configuration from environment
 const GATEWAY_URL = process.env.AGENT_PAY_GATEWAY_URL ?? "http://localhost:3000";
@@ -55,6 +56,7 @@ registerGetComputeQuote(server, gateway, null);
 registerCheckDeployment(server, gateway);
 registerListDeployments(server, gateway);
 registerStopDeployment(server, gateway);
+registerWatchEscrowDeployment(server, gateway);
 
 // Connect via stdio
 const transport = new StdioServerTransport();

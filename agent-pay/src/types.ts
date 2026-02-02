@@ -1,5 +1,11 @@
 // ── Gateway API Types ──
 
+export interface PortConfig {
+  port: number;
+  protocol: "tcp" | "udp";
+  expose: boolean;
+}
+
 export interface ComputeSpecs {
   cpu: number;
   memory: string;
@@ -11,6 +17,7 @@ export interface ComputeSpecs {
     count: number;
     model?: string;
   };
+  ports?: PortConfig[];
 }
 
 export interface QuoteRequest {
@@ -24,6 +31,7 @@ export interface QuoteRequest {
     count: number;
     model?: string;
   };
+  ports?: PortConfig[];
 }
 
 export interface QuotePricing {
@@ -126,6 +134,10 @@ export interface DeploymentStatus {
   status: "pending" | "deploying" | "running" | "stopped" | "failed";
   quoteId: string;
   paymentTxHash?: string;
+  // Escrow-related fields
+  escrowId?: string;
+  userAddress?: string;
+  escrowProofTx?: string;
   akash: AkashInfo;
   endpoints?: DeploymentEndpoint[];
   specs: ComputeSpecs;

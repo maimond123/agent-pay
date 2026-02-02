@@ -106,6 +106,18 @@ export class GatewayClient {
     );
   }
 
+  /**
+   * Get deployment by quote ID - for tracking escrow deposits
+   */
+  async getDeploymentByQuoteId(quoteId: string): Promise<{
+    status: "not_found" | "awaiting_deposit" | "deployment_found";
+    quoteId?: string;
+    message?: string;
+    deployment?: DeploymentStatus;
+  }> {
+    return this.request("GET", `/compute/by-quote/${quoteId}`);
+  }
+
   async listDeployments(status?: string): Promise<ListDeploymentsResponse> {
     const query = status ? `?status=${encodeURIComponent(status)}` : "";
     return this.request<ListDeploymentsResponse>("GET", `/compute${query}`);

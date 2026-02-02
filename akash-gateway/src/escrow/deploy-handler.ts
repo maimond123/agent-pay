@@ -27,6 +27,10 @@ export async function deployToAkashFromEscrow(
 
   logger.info({ deploymentId, escrowId }, 'Starting Akash deployment from escrow');
 
+  // Determine ports from quote or use default (SSH)
+  const deployPorts = quote.specs.ports || [{ port: 22, protocol: 'tcp' as const, expose: true }];
+  logger.info({ deploymentId, ports: deployPorts }, 'Using ports for deployment');
+
   // Update status to deploying
   updateDeploymentStatus(deploymentId, 'deploying');
 
@@ -37,7 +41,7 @@ export async function deployToAkashFromEscrow(
       memoryMb: parseToMb(quote.specs.memory),
       storageMb: parseToMb(quote.specs.storage),
       image: quote.specs.image,
-      ports: [{ port: 80, protocol: 'tcp', expose: true }],
+      ports: deployPorts,
       gpu: quote.specs.gpu,
     });
 
@@ -98,7 +102,7 @@ export async function deployToAkashFromEscrow(
       memoryMb: parseToMb(quote.specs.memory),
       storageMb: parseToMb(quote.specs.storage),
       image: quote.specs.image,
-      ports: [{ port: 80, protocol: 'tcp', expose: true }],
+      ports: deployPorts,
       gpu: quote.specs.gpu,
     });
 
@@ -110,11 +114,23 @@ export async function deployToAkashFromEscrow(
 
     if (status.state === 'active' && status.services.length > 0) {
       const service = status.services[0];
-      const endpoints = service.ips.map(ip => ({
+
+      // Extract endpoints from IPs
+      let endpoints = service.ips.map(ip => ({
         host: ip.ip || service.uris[0],
         port: ip.externalPort,
         protocol: ip.protocol.toLowerCase(),
       }));
+
+      // Fallback: if no IPs but URIs exist, use URIs as endpoints
+      if (endpoints.length === 0 && service.uris && service.uris.length > 0) {
+        endpoints = service.uris.map(uri => ({
+          host: uri,
+          port: deployPorts[0]?.port || 80,
+          protocol: 'tcp',
+        }));
+        logger.info({ deploymentId, uris: service.uris }, 'Using URIs as endpoints (no IPs available)');
+      }
 
       setDeploymentEndpoints(deploymentId, endpoints);
       updateDeploymentStatus(deploymentId, 'running');

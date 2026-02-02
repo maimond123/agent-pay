@@ -617,7 +617,7 @@ async function deposit(quoteIdArg?: string) {
     console.log(`✓ Deposit submitted!`);
     console.log(`  Transaction: ${depositTxHash}\n`);
     console.log("Waiting for confirmation...\n");
-    await new Promise((resolve) => setTimeout(resolve, 10000));
+    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
@@ -625,22 +625,145 @@ async function deposit(quoteIdArg?: string) {
 ╚═══════════════════════════════════════════════════════════════╝
 
   Amount: $${depositUsd} USDC
-  Status: Deposited - waiting for deployment
+  Tx: ${depositTxHash}
 
-  The gateway will now deploy your compute.
-  You'll be notified in Claude when it's ready.
-
-  Track on Basescan: https://basescan.org/tx/${depositTxHash}
 `);
+
+    // Disconnect wallet - no longer needed
+    await signClient.disconnect({
+      topic: session.topic,
+      reason: { code: 6000, message: "Deposit complete" },
+    });
+
+    // Now track deployment status
+    console.log("Tracking deployment status...\n");
+
+    const pollTimeout = 120000; // 2 minutes
+    const pollInterval = 3000; // 3 seconds
+    const startTime = Date.now();
+    let lastStatus = "";
+
+    while (Date.now() - startTime < pollTimeout) {
+      try {
+        const response = await fetch(`${config.gatewayUrl}/compute/by-quote/${quoteIdArg}`, {
+          headers: { Authorization: `Bearer ${config.token}` },
+        });
+
+        if (!response.ok) {
+          await new Promise((resolve) => setTimeout(resolve, pollInterval));
+          continue;
+        }
+
+        const result = await response.json() as {
+          status: string;
+          deployment?: {
+            deploymentId: string;
+            status: string;
+            akash?: {
+              dseq?: string;
+              provider?: string;
+              leaseId?: string;
+            };
+            endpoints?: Array<{ host: string; port: number; protocol: string }>;
+            expiresAt: number;
+            escrowProofTx?: string;
+          };
+        };
+
+        if (result.status === "awaiting_deposit") {
+          process.stdout.write(".");
+          await new Promise((resolve) => setTimeout(resolve, pollInterval));
+          continue;
+        }
+
+        if (result.status === "deployment_found" && result.deployment) {
+          const deployment = result.deployment;
+          const currentStatus = deployment.status;
+
+          // Log status changes
+          if (currentStatus !== lastStatus) {
+            lastStatus = currentStatus;
+            console.log(""); // New line after dots
+
+            if (currentStatus === "pending") {
+              console.log("  ✓ Deposit detected - creating deployment...");
+            } else if (currentStatus === "deploying") {
+              console.log("  ✓ Deploying to Akash Network...");
+              if (deployment.akash?.dseq) {
+                console.log(`    Akash dseq: ${deployment.akash.dseq}`);
+              }
+              if (deployment.akash?.provider) {
+                console.log(`    Provider: ${deployment.akash.provider.slice(0, 30)}...`);
+              }
+            }
+          }
+
+          // Check for terminal states
+          if (currentStatus === "running") {
+            console.log("  ✓ Container is RUNNING!\n");
+
+            const endpointLines = deployment.endpoints && deployment.endpoints.length > 0
+              ? deployment.endpoints.map(ep => `    ${ep.protocol}://${ep.host}:${ep.port}`).join("\n")
+              : "    (still provisioning - check Claude for updates)";
+
+            console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Deployment Complete!                         ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Deployment ID: ${deployment.deploymentId}
+  Status: ${deployment.status}
+  Akash dseq: ${deployment.akash?.dseq || "N/A"}
+
+  Endpoints:
+${endpointLines}
+
+  Expires: ${new Date(deployment.expiresAt).toISOString()}
+${deployment.escrowProofTx ? `  Escrow proof tx: ${deployment.escrowProofTx}` : ""}
+
+  You can also check status in Claude Code!
+`);
+            process.exit(0);
+          }
+
+          if (currentStatus === "failed") {
+            console.log("  ✗ Deployment FAILED\n");
+
+            console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Deployment Failed                            ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Deployment ID: ${deployment.deploymentId}
+${deployment.escrowProofTx ? `  Refund tx: ${deployment.escrowProofTx}` : ""}
+
+  Your deposit has been automatically refunded via escrow.
+  You can try again with different specs.
+`);
+            process.exit(1);
+          }
+        }
+      } catch {
+        // Polling error - continue
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    }
+
+    // Timeout
+    console.log(`
+
+Timed out waiting for deployment status.
+The deployment may still be in progress.
+
+Check status in Claude Code by saying "check my deployment"
+or run: npx @agent-pay/mcp escrow-status <escrowId>
+`);
+
   } catch (error) {
     console.error("\nDeposit was rejected.");
     process.exit(1);
   }
-
-  await signClient.disconnect({
-    topic: session.topic,
-    reason: { code: 6000, message: "Deposit complete" },
-  });
 
   process.exit(0);
 }

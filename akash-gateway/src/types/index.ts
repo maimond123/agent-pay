@@ -15,6 +15,11 @@ export const ComputeQuoteRequestSchema = z.object({
     count: z.number().min(1),
     model: z.string().optional(),
   }).optional(),
+  ports: z.array(z.object({
+    port: z.number(),
+    protocol: z.enum(['tcp', 'udp']).default('tcp'),
+    expose: z.boolean().default(true),
+  })).optional(),
 });
 
 export const ComputeProvisionRequestSchema = z.object({
@@ -60,6 +65,11 @@ export interface ComputeQuote {
       count: number;
       model?: string;
     };
+    ports?: Array<{
+      port: number;
+      protocol: 'tcp' | 'udp';
+      expose: boolean;
+    }>;
   };
   pricing: {
     akashCostUakt: string;
