@@ -443,8 +443,28 @@ router.get('/by-quote/:quoteId', async (req: Request, res: Response, next: NextF
       });
     }
 
-    // Check if a deployment was created for this quote
-    const deployment = getDeploymentByQuoteId(quoteId);
+    // Check if a deployment was created for this quote (direct match)
+    let deployment = getDeploymentByQuoteId(quoteId);
+
+    // If no direct match, check if there's a deployment with the same specsHash
+    // This handles the case where multiple quotes have the same specsHash
+    // (e.g., multi-provider quotes) and the escrow listener found a different quote
+    if (!deployment && quote.specsHash) {
+      const allDeployments = listDeployments();
+      for (const d of allDeployments) {
+        const deploymentQuote = getQuote(d.quoteId);
+        if (deploymentQuote?.specsHash === quote.specsHash) {
+          deployment = d;
+          logger.info({
+            requestedQuoteId: quoteId,
+            foundQuoteId: d.quoteId,
+            specsHash: quote.specsHash,
+          }, 'Found deployment via specsHash match');
+          break;
+        }
+      }
+    }
+
     if (!deployment) {
       // Quote exists but no deployment yet - user hasn't deposited
       return res.json({
