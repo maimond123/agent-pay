@@ -300,17 +300,12 @@ export class AkashClient {
         value: sdk.MsgCreateDeployment.fromPartial(deployment),
       };
 
-      const fee = {
-        amount: [{ denom: 'uakt', amount: '25000' }],
-        gas: '1000000',
-      };
-
-      // Broadcast transaction
+      // Use auto gas estimation
       const tx = await this.client.signAndBroadcast(
         this.address,
         [msg],
-        fee,
-        'x402-akash-gateway deployment'
+        "auto",
+        'agent-pay deployment'
       );
 
       if (tx.code !== 0) {
@@ -445,16 +440,12 @@ export class AkashClient {
         }),
       };
 
-      const fee = {
-        amount: [{ denom: 'uakt', amount: '20000' }],
-        gas: '800000',
-      };
-
+      // Use auto gas estimation
       const tx = await this.client.signAndBroadcast(
         this.address,
         [msg],
-        fee,
-        'x402-akash-gateway lease'
+        "auto",
+        'agent-pay lease'
       );
 
       if (tx.code !== 0) {
@@ -763,16 +754,12 @@ export class AkashClient {
         }),
       };
 
-      const fee = {
-        amount: [{ denom: 'uakt', amount: '25000' }],
-        gas: '1000000',
-      };
-
+      // Use auto gas estimation with 1.4x multiplier for safety
       const tx = await this.client.signAndBroadcast(
         this.address,
         [msg],
-        fee,
-        'x402-akash-gateway close deployment'
+        "auto",
+        'agent-pay close deployment'
       );
 
       if (tx.code !== 0) {
