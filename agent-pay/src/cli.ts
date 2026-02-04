@@ -1,17 +1,42 @@
 #!/usr/bin/env node
 
+/**
+ * Agent-Pay CLI (Trustless Flow)
+ *
+ * CLI for trustless compute provisioning on Akash Network.
+ * All signing operations happen here, in the user's CLI process.
+ * The agent NEVER has access to keys or mnemonics.
+ */
+
 import { SignClient } from "@walletconnect/sign-client";
 import QRCode from "qrcode-terminal";
-import { encodeFunctionData, parseUnits, formatUnits, createPublicClient, http, type Hex } from "viem";
+import { encodeFunctionData, parseUnits, createPublicClient, http, type Hex } from "viem";
 import { base, baseSepolia } from "viem/chains";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
+// Import trustless modules
+import {
+  createAkashWallet,
+  saveWallet,
+  listStoredWallets,
+  getDefaultWalletAddress,
+  getOrUnlockWallet,
+  promptPassword,
+} from "./wallet/index.js";
+import {
+  deployToAkash,
+  closeDeployment,
+  getWalletBalance,
+  getDeploymentStatus,
+  queryDeployments,
+} from "./akash/index.js";
+import { createBridgeRoute, getBridgeStatus, waitForBridgeCompletion } from "./bridge/index.js";
+import type { ComputeSpecs } from "./types.js";
+
 // Configuration
 const WALLETCONNECT_PROJECT_ID = process.env.WALLETCONNECT_PROJECT_ID || "7195fdf3f03fb2c3e50485e0821196d7";
-const GATEWAY_URL = process.env.AGENT_PAY_GATEWAY_URL || "https://gateway.agentpay.dev";
-const NETWORK = process.env.AGENT_PAY_NETWORK || "base";
 
 // USDC addresses
 const USDC_ADDRESSES: Record<string, `0x${string}`> = {
@@ -45,59 +70,23 @@ const APPROVE_ABI = [
   },
 ] as const;
 
-// Escrow contract deposit ABI
-const ESCROW_DEPOSIT_ABI = [
-  {
-    name: "deposit",
-    type: "function",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "specsHash", type: "bytes32" },
-      { name: "quotedAmount", type: "uint256" },
-      { name: "depositAmount", type: "uint256" },
-    ],
-    outputs: [{ name: "escrowId", type: "bytes32" }],
-  },
-] as const;
-
-// Escrow contract read ABI
-const ESCROW_READ_ABI = [
-  {
-    name: "escrows",
-    type: "function",
-    stateMutability: "view",
-    inputs: [{ name: "", type: "bytes32" }],
-    outputs: [
-      { name: "user", type: "address" },
-      { name: "depositAmount", type: "uint256" },
-      { name: "quotedAmount", type: "uint256" },
-      { name: "specsHash", type: "bytes32" },
-      { name: "createdAt", type: "uint256" },
-      { name: "status", type: "uint8" },
-      { name: "akashDseq", type: "string" },
-      { name: "akashProvider", type: "string" },
-      { name: "actualCost", type: "uint256" },
-    ],
-  },
-] as const;
-
 // Config file path
 const CONFIG_DIR = join(homedir(), ".agent-pay");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 
 interface Config {
-  walletAddress: string;
-  token: string;
-  gatewayUrl: string;
-  network: string;
+  walletAddress?: string;
+  akashAddress?: string;
+  network?: string;
+  evmNetwork?: string;
 }
 
-function loadConfig(): Config | null {
-  if (!existsSync(CONFIG_PATH)) return null;
+function loadConfig(): Config {
+  if (!existsSync(CONFIG_PATH)) return {};
   try {
     return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
   } catch {
-    return null;
+    return {};
   }
 }
 
@@ -114,7 +103,7 @@ async function initWalletConnect(): Promise<InstanceType<typeof SignClient>> {
       projectId: WALLETCONNECT_PROJECT_ID,
       metadata: {
         name: "Agent-Pay",
-        description: "Pay for compute with USDC",
+        description: "Trustless compute provisioning",
         url: "https://agentpay.dev",
         icons: ["https://agentpay.dev/icon.png"],
       },
@@ -125,8 +114,8 @@ async function initWalletConnect(): Promise<InstanceType<typeof SignClient>> {
   }
 }
 
-async function connectWallet(signClient: InstanceType<typeof SignClient>): Promise<{ session: any; walletAddress: `0x${string}` }> {
-  const chainId = CHAIN_IDS[NETWORK] || CHAIN_IDS["base"];
+async function connectEvmWallet(signClient: InstanceType<typeof SignClient>, evmNetwork: string = "base"): Promise<{ session: any; walletAddress: `0x${string}` }> {
+  const chainId = CHAIN_IDS[evmNetwork] || CHAIN_IDS["base"];
 
   const { uri, approval } = await signClient.connect({
     requiredNamespaces: {
@@ -143,7 +132,7 @@ async function connectWallet(signClient: InstanceType<typeof SignClient>): Promi
     process.exit(1);
   }
 
-  console.log("Scan this QR code with your mobile wallet:\n");
+  console.log("\nScan this QR code with your mobile wallet:\n");
   console.log("(MetaMask, Coinbase Wallet, Rainbow, Trust Wallet, etc.)\n");
 
   QRCode.generate(uri, { small: true }, (qr) => {
@@ -171,732 +160,686 @@ async function connectWallet(signClient: InstanceType<typeof SignClient>): Promi
 }
 
 // ============================================================================
-// SETUP COMMAND
+// WALLET CREATE COMMAND
 // ============================================================================
 
-async function setup() {
+async function walletCreate() {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║                    Agent-Pay Setup                            ║
+║                Create New Akash Wallet                        ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
 
-  console.log("Initializing WalletConnect...\n");
-  const signClient = await initWalletConnect();
+  // Check if wallet already exists
+  const existingWallets = listStoredWallets();
+  if (existingWallets.length > 0) {
+    console.log("You already have an Akash wallet:");
+    console.log(`  Address: ${existingWallets[0].address}`);
+    console.log("");
+    console.log("To create an additional wallet, use: wallet create --force");
+    console.log("To check your balance, use: wallet balance");
 
-  const { session, walletAddress } = await connectWallet(signClient);
-
-  console.log(`✓ Connected: ${walletAddress}`);
-  console.log(`  Network: ${NETWORK}\n`);
-
-  // Register with gateway
-  console.log("Registering with gateway...\n");
-
-  let token: string;
-  try {
-    const response = await fetch(`${GATEWAY_URL}/auth/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ walletAddress }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Registration failed: ${response.statusText}`);
+    if (!process.argv.includes("--force")) {
+      process.exit(0);
     }
+    console.log("\n--force flag detected, creating new wallet...\n");
+  }
 
-    const result = await response.json() as { token: string };
-    token = result.token;
-  } catch (error) {
-    console.error("Failed to register with gateway:", error);
+  // Generate new wallet
+  console.log("Generating new wallet...\n");
+  const { address, mnemonic, pubkey } = await createAkashWallet();
+
+  console.log("╔═══════════════════════════════════════════════════════════════╗");
+  console.log("║  IMPORTANT: Write down your recovery phrase!                  ║");
+  console.log("╚═══════════════════════════════════════════════════════════════╝");
+  console.log("");
+  console.log("Recovery Phrase (24 words):");
+  console.log("");
+  console.log(`  ${mnemonic}`);
+  console.log("");
+  console.log("Store this phrase securely. Anyone with these words can");
+  console.log("access your funds. You will NOT see this again.");
+  console.log("");
+
+  // Get password for encryption
+  const password = await promptPassword("Create a password to encrypt your wallet: ");
+  const confirmPassword = await promptPassword("Confirm password: ");
+
+  if (password !== confirmPassword) {
+    console.error("\nPasswords do not match. Please try again.");
     process.exit(1);
   }
 
-  console.log("✓ Registered with gateway\n");
+  // Save encrypted wallet
+  const walletPath = saveWallet(address, mnemonic, password);
 
-  // Save config
-  const config: Config = {
-    walletAddress,
-    token,
-    gatewayUrl: GATEWAY_URL,
-    network: NETWORK,
-  };
+  // Update config
+  const config = loadConfig();
+  config.akashAddress = address;
   saveConfig(config);
-
-  // Update Claude settings
-  const claudeConfigDir = join(homedir(), ".claude");
-  const settingsPath = join(claudeConfigDir, "settings.local.json");
-
-  if (!existsSync(claudeConfigDir)) {
-    mkdirSync(claudeConfigDir, { recursive: true });
-  }
-
-  let settings: Record<string, unknown> = {};
-  if (existsSync(settingsPath)) {
-    try {
-      settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    } catch {
-      settings = {};
-    }
-  }
-
-  const mcpServers = (settings.mcpServers as Record<string, unknown>) || {};
-  mcpServers["agent-pay"] = {
-    command: "npx",
-    args: ["@agent-pay/mcp"],
-    env: {
-      AGENT_PAY_TOKEN: token,
-      AGENT_PAY_GATEWAY_URL: GATEWAY_URL,
-      AGENT_PAY_NETWORK: NETWORK,
-    },
-  };
-  settings.mcpServers = mcpServers;
-
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-  console.log(`✓ Configuration saved\n`);
-
-  // Disconnect WalletConnect
-  await signClient.disconnect({
-    topic: session.topic,
-    reason: { code: 6000, message: "Setup complete" },
-  });
 
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║                    Setup Complete!                            ║
+║                  Wallet Created Successfully!                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-Your wallet: ${walletAddress}
-Network:     ${NETWORK}
-Gateway:     ${GATEWAY_URL}
+  Address: ${address}
+  Saved:   ${walletPath}
 
-You can now use agent-pay in Claude Code:
+Next steps:
 
-  "provision a GPU server for ML training"
-  "get me a compute quote for 2 CPUs and 4GB RAM"
+  1. Fund your wallet by bridging USDC from Base:
+     npx @agent-pay/mcp bridge --amount 10
 
-When you provision compute, you'll be asked to approve the exact
-amount needed. No pre-approval required!
+  2. Then provision compute:
+     npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04
 `);
-
-  process.exit(0);
 }
 
 // ============================================================================
-// APPROVE COMMAND
+// WALLET LIST COMMAND
 // ============================================================================
 
-async function approve(amountArg?: string) {
-  const config = loadConfig();
-  if (!config) {
-    console.error("Not set up yet. Run: npx @agent-pay/mcp setup");
+async function walletList() {
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                    Stored Wallets                             ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  const wallets = listStoredWallets();
+
+  if (wallets.length === 0) {
+    console.log("No wallets found. Create one with:");
+    console.log("  npx @agent-pay/mcp wallet create");
+    process.exit(0);
+  }
+
+  const defaultAddress = getDefaultWalletAddress();
+
+  for (const wallet of wallets) {
+    const isDefault = wallet.address === defaultAddress ? " (default)" : "";
+    console.log(`  ${wallet.address}${isDefault}`);
+    console.log(`    Created: ${wallet.createdAt}`);
+    console.log(`    Network: ${wallet.network}`);
+    console.log("");
+  }
+}
+
+// ============================================================================
+// WALLET BALANCE COMMAND
+// ============================================================================
+
+async function walletBalance(addressArg?: string) {
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                    Wallet Balance                             ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  let address = addressArg;
+  if (!address) {
+    address = getDefaultWalletAddress() || undefined;
+    if (!address) {
+      console.error("No wallet found. Create one with: npx @agent-pay/mcp wallet create");
+      process.exit(1);
+    }
+  }
+
+  const isTestnet = process.argv.includes("--testnet");
+  const network = isTestnet ? "testnet" : "mainnet";
+
+  console.log(`Address: ${address}`);
+  console.log(`Network: ${network}\n`);
+
+  try {
+    const balance = await getWalletBalance(address, network);
+
+    console.log("Balances:");
+    console.log(`  USDC:  ${balance.usdcFormatted} axlUSDC`);
+    console.log(`  AKT:   ${balance.uaktFormatted} AKT`);
+    console.log("");
+
+    const usdcBalance = parseFloat(balance.usdcFormatted);
+    const aktBalance = parseFloat(balance.uaktFormatted);
+
+    if (usdcBalance < 1.0) {
+      console.log("Your USDC balance is low. Bridge more funds:");
+      console.log("  npx @agent-pay/mcp bridge --amount 10");
+    }
+
+    if (aktBalance < 0.1) {
+      console.log("Your AKT balance is low (needed for gas). The bridge command");
+      console.log("includes a small AKT swap for gas automatically.");
+    }
+
+    // Show active deployments
+    try {
+      const deployments = await queryDeployments(address, network);
+      const activeDeployments = deployments.filter((d) => d.state === 1);
+
+      if (activeDeployments.length > 0) {
+        console.log(`\nActive Deployments: ${activeDeployments.length}`);
+        for (const d of activeDeployments) {
+          console.log(`  DSEQ: ${d.deploymentId.dseq}`);
+        }
+      }
+    } catch {
+      // Deployments query may fail
+    }
+  } catch (error) {
+    console.error("Failed to fetch balance:", error);
+    process.exit(1);
+  }
+}
+
+// ============================================================================
+// DEPLOY COMMAND
+// ============================================================================
+
+async function deploy() {
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Deploy to Akash Network                      ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  // Parse arguments
+  const args = process.argv.slice(3);
+  const getArg = (name: string): string | undefined => {
+    const index = args.indexOf(`--${name}`);
+    return index !== -1 ? args[index + 1] : undefined;
+  };
+
+  const cpu = parseInt(getArg("cpu") || "1");
+  const memory = getArg("memory") || "1Gi";
+  const storage = getArg("storage") || "5Gi";
+  const image = getArg("image") || "ubuntu:22.04";
+  const hours = parseInt(getArg("hours") || "1");
+  const isTestnet = args.includes("--testnet");
+  const network = isTestnet ? "testnet" : "mainnet";
+
+  // Parse ports
+  const ports: Array<{ port: number; protocol: "tcp" | "udp"; expose: boolean }> = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--port") {
+      const portStr = args[i + 1];
+      if (portStr) {
+        const [portNum, proto] = portStr.split("/");
+        ports.push({
+          port: parseInt(portNum),
+          protocol: (proto as "tcp" | "udp") || "tcp",
+          expose: true,
+        });
+      }
+    }
+  }
+
+  // Default to SSH port if no ports specified
+  if (ports.length === 0) {
+    ports.push({ port: 22, protocol: "tcp", expose: true });
+  }
+
+  // Parse env vars
+  const env: Record<string, string> = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--env") {
+      const envStr = args[i + 1];
+      if (envStr) {
+        const [key, ...valueParts] = envStr.split("=");
+        env[key] = valueParts.join("=");
+      }
+    }
+  }
+
+  // Parse GPU
+  const gpuCount = parseInt(getArg("gpu-count") || "0");
+  const gpuModel = getArg("gpu-model");
+  const gpu = gpuCount > 0 ? { count: gpuCount, model: gpuModel } : undefined;
+
+  const specs: ComputeSpecs = {
+    cpu,
+    memory,
+    storage,
+    image,
+    hours,
+    gpu,
+    ports,
+  };
+
+  console.log("Deployment Specs:");
+  console.log(`  CPU: ${cpu} cores`);
+  console.log(`  Memory: ${memory}`);
+  console.log(`  Storage: ${storage}`);
+  console.log(`  Image: ${image}`);
+  console.log(`  Duration: ${hours} hours`);
+  console.log(`  Ports: ${ports.map((p) => `${p.port}/${p.protocol}`).join(", ")}`);
+  if (gpu) {
+    console.log(`  GPU: ${gpu.count}x ${gpu.model || "any"}`);
+  }
+  console.log(`  Network: ${network}`);
+  console.log("");
+
+  // Get wallet
+  const address = getDefaultWalletAddress();
+  if (!address) {
+    console.error("No wallet found. Create one with: npx @agent-pay/mcp wallet create");
     process.exit(1);
   }
 
-  // Parse amount
-  const amount = parseFloat(amountArg || "100");
-  if (isNaN(amount) || amount <= 0) {
-    console.error("Invalid amount. Usage: npx @agent-pay/mcp approve <amount>");
-    console.error("Example: npx @agent-pay/mcp approve 50");
+  console.log(`Wallet: ${address}\n`);
+
+  // Unlock wallet
+  const wallet = await getOrUnlockWallet(address);
+
+  try {
+    const result = await deployToAkash(wallet, {
+      specs,
+      env: Object.keys(env).length > 0 ? env : undefined,
+      network,
+    });
+
+    console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Deployment Successful!                       ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  DSEQ: ${result.dseq}
+  Provider: ${result.provider}
+
+  Deployment TX: ${result.txHashes.deployment}
+  Lease TX: ${result.txHashes.lease}
+`);
+
+    if (result.endpoints.length > 0) {
+      console.log("  Endpoints:");
+      for (const ep of result.endpoints) {
+        console.log(`    ${ep.protocol}://${ep.host}:${ep.externalPort}`);
+      }
+    }
+
+    console.log(`
+To check status: npx @agent-pay/mcp status ${result.dseq}
+To close:        npx @agent-pay/mcp close ${result.dseq}
+`);
+  } catch (error) {
+    console.error("\nDeployment failed:", error);
+    process.exit(1);
+  }
+}
+
+// ============================================================================
+// CLOSE COMMAND
+// ============================================================================
+
+async function close(dseqArg?: string) {
+  if (!dseqArg) {
+    console.error("Usage: npx @agent-pay/mcp close <dseq>");
     process.exit(1);
   }
 
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║                  Approve USDC Spending                        ║
+║                  Close Akash Deployment                       ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
 
-  console.log(`Amount: $${amount.toFixed(2)} USDC`);
-  console.log(`Wallet: ${config.walletAddress}\n`);
+  const isTestnet = process.argv.includes("--testnet");
+  const network = isTestnet ? "testnet" : "mainnet";
 
-  console.log("This approval allows Agent-Pay to charge your wallet");
-  console.log("for compute deployments, up to the amount you specify.");
-  console.log("You can revoke this anytime via your wallet or revoke.cash\n");
-
-  // Get gateway address
-  let gatewayAddress: `0x${string}`;
-  try {
-    const response = await fetch(`${config.gatewayUrl}/`);
-    const info = await response.json() as { payment?: { gatewayAddress?: string } };
-    gatewayAddress = (info.payment?.gatewayAddress || "") as `0x${string}`;
-    if (!gatewayAddress || gatewayAddress === "0x0000000000000000000000000000000000000000") {
-      throw new Error("Gateway address not configured");
-    }
-  } catch (error) {
-    console.error("Failed to fetch gateway info:", error);
+  const address = getDefaultWalletAddress();
+  if (!address) {
+    console.error("No wallet found. Create one with: npx @agent-pay/mcp wallet create");
     process.exit(1);
   }
 
-  console.log("Initializing WalletConnect...\n");
-  const signClient = await initWalletConnect();
+  console.log(`DSEQ: ${dseqArg}`);
+  console.log(`Wallet: ${address}`);
+  console.log(`Network: ${network}\n`);
 
-  const { session, walletAddress } = await connectWallet(signClient);
-
-  if (walletAddress.toLowerCase() !== config.walletAddress.toLowerCase()) {
-    console.error(`\nWallet mismatch!`);
-    console.error(`  Expected: ${config.walletAddress}`);
-    console.error(`  Got: ${walletAddress}`);
-    console.error(`\nPlease connect the same wallet you used during setup.`);
-    process.exit(1);
-  }
-
-  console.log(`✓ Connected: ${walletAddress}\n`);
-
-  // Request approval
-  console.log("Requesting approval...\n");
-  console.log("┌─────────────────────────────────────────────────────────────┐");
-  console.log("│  Check your wallet app to approve the transaction.         │");
-  console.log("│                                                             │");
-  console.log(`│  Amount: $${amount.toFixed(2)} USDC`);
-  console.log("│  This is your spending limit, not an immediate charge.     │");
-  console.log("└─────────────────────────────────────────────────────────────┘\n");
-
-  const chainId = CHAIN_IDS[config.network] || CHAIN_IDS["base"];
-  const usdcAddress = USDC_ADDRESSES[config.network] || USDC_ADDRESSES["base"];
-  const approvalAmount = parseUnits(amount.toString(), 6);
-
-  const approveData = encodeFunctionData({
-    abi: APPROVE_ABI,
-    functionName: "approve",
-    args: [gatewayAddress, approvalAmount],
-  });
+  // Unlock wallet
+  const wallet = await getOrUnlockWallet(address);
 
   try {
-    const txHash = await signClient.request({
-      topic: session.topic,
-      chainId,
-      request: {
-        method: "eth_sendTransaction",
-        params: [
-          {
-            from: walletAddress,
-            to: usdcAddress,
-            data: approveData,
-          },
-        ],
-      },
-    });
-
-    console.log(`✓ Approval submitted!`);
-    console.log(`  Transaction: ${txHash}\n`);
-    console.log("Waiting for confirmation...\n");
-
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const result = await closeDeployment(wallet, dseqArg, network);
 
     console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║                   Approval Complete!                          ║
+║                  Deployment Closed                            ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-You've approved up to $${amount.toFixed(2)} USDC for compute spending.
+  DSEQ: ${dseqArg}
+  TX: ${result.txHash}
 
-Go back to Claude Code and try provisioning compute again!
+  Unused funds will be refunded to your wallet.
 `);
   } catch (error) {
-    console.error("\nApproval was rejected or failed.");
+    console.error("\nFailed to close deployment:", error);
     process.exit(1);
   }
-
-  await signClient.disconnect({
-    topic: session.topic,
-    reason: { code: 6000, message: "Approval complete" },
-  });
-
-  process.exit(0);
 }
 
 // ============================================================================
 // STATUS COMMAND
 // ============================================================================
 
-async function status() {
-  const config = loadConfig();
-  if (!config) {
-    console.error("Not set up yet. Run: npx @agent-pay/mcp setup");
+async function statusCmd(dseqArg?: string) {
+  const isTestnet = process.argv.includes("--testnet");
+  const network = isTestnet ? "testnet" : "mainnet";
+
+  const address = getDefaultWalletAddress();
+  if (!address) {
+    console.error("No wallet found. Create one with: npx @agent-pay/mcp wallet create");
     process.exit(1);
   }
 
-  console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║                    Agent-Pay Status                           ║
-╚═══════════════════════════════════════════════════════════════╝
-`);
-
-  console.log(`Wallet:  ${config.walletAddress}`);
-  console.log(`Network: ${config.network}`);
-  console.log(`Gateway: ${config.gatewayUrl}\n`);
-
-  // Get balance and allowance from gateway
-  try {
-    const response = await fetch(`${config.gatewayUrl}/auth/info`, {
-      headers: { Authorization: `Bearer ${config.token}` },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch info: ${response.statusText}`);
-    }
-
-    const info = await response.json() as {
-      balance?: { usdc: string };
-      allowance?: { usdc: string };
-    };
-
-    console.log(`USDC Balance:   $${info.balance?.usdc || "0.00"}`);
-    console.log(`Spending Limit: $${info.allowance?.usdc || "0.00"}\n`);
-
-    const allowance = parseFloat(info.allowance?.usdc || "0");
-    if (allowance === 0) {
-      console.log("No spending limit set. To approve spending, run:");
-      console.log("  npx @agent-pay/mcp approve 50\n");
-    } else if (allowance < 10) {
-      console.log("Low spending limit. To increase, run:");
-      console.log("  npx @agent-pay/mcp approve 50\n");
-    }
-  } catch (error) {
-    console.error("Failed to fetch wallet info:", error);
-  }
-}
-
-// ============================================================================
-// DEPOSIT COMMAND
-// ============================================================================
-
-async function deposit(quoteIdArg?: string) {
-  const config = loadConfig();
-  if (!config) {
-    console.error("Not set up yet. Run: npx @agent-pay/mcp setup");
-    process.exit(1);
-  }
-
-  if (!quoteIdArg) {
-    console.error("Usage: npx @agent-pay/mcp deposit <quoteId>");
-    console.error("\nGet a quote first by asking Claude for compute.");
-    process.exit(1);
-  }
-
-  console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║                    Deposit into Escrow                        ║
-╚═══════════════════════════════════════════════════════════════╝
-`);
-
-  // Fetch quote details from gateway
-  console.log("Fetching quote details...\n");
-
-  let quote: any;
-  try {
-    const response = await fetch(`${config.gatewayUrl}/compute/quote/${quoteIdArg}`, {
-      headers: { Authorization: `Bearer ${config.token}` },
-    });
-
-    if (!response.ok) {
-      // Quote endpoint might not exist, try to get from quotes list
-      console.error("Quote not found. Please request a new quote via Claude.");
-      process.exit(1);
-    }
-
-    quote = await response.json();
-  } catch (error) {
-    console.error("Failed to fetch quote. Please request a new quote via Claude.");
-    process.exit(1);
-  }
-
-  if (!quote.escrow) {
-    console.error("This quote does not support escrow deposits.");
-    console.error("The gateway may not have escrow enabled.");
-    process.exit(1);
-  }
-
-  const escrowContract = quote.escrow.contract as `0x${string}`;
-  const specsHash = quote.specsHash as `0x${string}`;
-  const quotedAmount = BigInt(quote.escrow.quotedAmount);
-  const depositAmount = BigInt(quote.escrow.suggestedDeposit);
-  const depositUsd = (Number(depositAmount) / 1_000_000).toFixed(2);
-  const quotedUsd = (Number(quotedAmount) / 1_000_000).toFixed(2);
-
-  console.log("Quote Details:");
-  console.log(`  Specs: ${quote.specs.cpu} CPU, ${quote.specs.memory} RAM, ${quote.specs.storage} storage`);
-  console.log(`  Image: ${quote.specs.image}`);
-  console.log(`  Duration: ${quote.specs.hours} hours`);
-  console.log(`  Cost: $${quotedUsd} USDC\n`);
-
-  console.log(`Deposit Amount: $${depositUsd} USDC (includes buffer)\n`);
-
-  console.log("Your Protections:");
-  console.log("  ✓ Funds held in escrow (not sent to gateway yet)");
-  console.log("  ✓ Full refund if deployment fails");
-  console.log("  ✓ Excess refunded after deployment");
-  console.log("  ✓ All transactions recorded on-chain\n");
-
-  // Initialize WalletConnect
-  console.log("Initializing WalletConnect...\n");
-  const signClient = await initWalletConnect();
-
-  console.log("Scan QR code to connect and approve deposit:\n");
-  const { session, walletAddress } = await connectWallet(signClient);
-
-  if (walletAddress.toLowerCase() !== config.walletAddress.toLowerCase()) {
-    console.error(`\nWallet mismatch!`);
-    console.error(`  Expected: ${config.walletAddress}`);
-    console.error(`  Got: ${walletAddress}`);
-    process.exit(1);
-  }
-
-  console.log(`✓ Connected: ${walletAddress}\n`);
-
-  const chainId = CHAIN_IDS[config.network] || CHAIN_IDS["base"];
-  const usdcAddress = USDC_ADDRESSES[config.network] || USDC_ADDRESSES["base"];
-
-  // Step 1: Approve USDC spending for escrow contract
-  console.log("Step 1/2: Approving USDC spending for escrow...\n");
-  console.log("┌─────────────────────────────────────────────────────────────┐");
-  console.log("│  Check your wallet to approve USDC spending.                │");
-  console.log(`│  Amount: $${depositUsd} USDC                                 `);
-  console.log("│  Spender: AgentPayEscrow (verified contract)                │");
-  console.log("└─────────────────────────────────────────────────────────────┘\n");
-
-  const approveData = encodeFunctionData({
-    abi: APPROVE_ABI,
-    functionName: "approve",
-    args: [escrowContract, depositAmount],
-  });
-
-  try {
-    const approveTxHash = await signClient.request({
-      topic: session.topic,
-      chainId,
-      request: {
-        method: "eth_sendTransaction",
-        params: [
-          {
-            from: walletAddress,
-            to: usdcAddress,
-            data: approveData,
-          },
-        ],
-      },
-    });
-
-    console.log(`✓ Approval submitted: ${approveTxHash}`);
-    console.log("Waiting for confirmation...\n");
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  } catch (error) {
-    console.error("\nApproval was rejected.");
-    process.exit(1);
-  }
-
-  // Step 2: Deposit into escrow
-  console.log("Step 2/2: Depositing into escrow...\n");
-  console.log("┌─────────────────────────────────────────────────────────────┐");
-  console.log("│  Check your wallet to confirm the deposit.                  │");
-  console.log(`│  Amount: $${depositUsd} USDC into escrow                     `);
-  console.log("└─────────────────────────────────────────────────────────────┘\n");
-
-  const depositData = encodeFunctionData({
-    abi: ESCROW_DEPOSIT_ABI,
-    functionName: "deposit",
-    args: [specsHash, quotedAmount, depositAmount],
-  });
-
-  try {
-    const depositTxHash = await signClient.request({
-      topic: session.topic,
-      chainId,
-      request: {
-        method: "eth_sendTransaction",
-        params: [
-          {
-            from: walletAddress,
-            to: escrowContract,
-            data: depositData,
-          },
-        ],
-      },
-    });
-
-    console.log(`✓ Deposit submitted!`);
-    console.log(`  Transaction: ${depositTxHash}\n`);
-    console.log("Waiting for confirmation...\n");
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-
+  if (dseqArg) {
+    // Show specific deployment status
     console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║                    Deposit Complete!                          ║
+║                  Deployment Status                            ║
 ╚═══════════════════════════════════════════════════════════════╝
-
-  Amount: $${depositUsd} USDC
-  Tx: ${depositTxHash}
-
 `);
 
-    // Disconnect wallet - no longer needed
-    await signClient.disconnect({
-      topic: session.topic,
-      reason: { code: 6000, message: "Deposit complete" },
-    });
+    try {
+      const status = await getDeploymentStatus(address, dseqArg, network);
 
-    // Now track deployment status
-    console.log("Tracking deployment status...\n");
-
-    const pollTimeout = 120000; // 2 minutes
-    const pollInterval = 2000; // 2 seconds for more responsive updates
-    const startTime = Date.now();
-
-    // Track what we've already printed to avoid duplicates
-    let printedDeposit = false;
-    let printedDeploymentId = false;
-    let printedDseq = false;
-    let printedWaitingBids = false;
-    let printedProvider = false;
-    let printedLease = false;
-    let printedManifest = false;
-    let lastDseq = "";
-    let lastProvider = "";
-    let lastLeaseId = "";
-
-    while (Date.now() - startTime < pollTimeout) {
-      try {
-        const response = await fetch(`${config.gatewayUrl}/compute/by-quote/${quoteIdArg}`, {
-          headers: { Authorization: `Bearer ${config.token}` },
-        });
-
-        if (!response.ok) {
-          await new Promise((resolve) => setTimeout(resolve, pollInterval));
-          continue;
-        }
-
-        const result = await response.json() as {
-          status: string;
-          deployment?: {
-            deploymentId: string;
-            status: string;
-            akash?: {
-              dseq?: string;
-              provider?: string;
-              leaseId?: string;
-            };
-            endpoints?: Array<{ host: string; port: number; protocol: string }>;
-            expiresAt: number;
-            escrowProofTx?: string;
-          };
-        };
-
-        if (result.status === "awaiting_deposit") {
-          const elapsed = Math.round((Date.now() - startTime) / 1000);
-          process.stdout.write(`\r  Waiting for deposit confirmation... (${elapsed}s)`);
-          await new Promise((resolve) => setTimeout(resolve, pollInterval));
-          continue;
-        }
-
-        if (result.status === "deployment_found" && result.deployment) {
-          const deployment = result.deployment;
-          const akash = deployment.akash || {};
-
-          // Print deposit detected
-          if (!printedDeposit) {
-            console.log("\n");
-            console.log("  ✓ Deposit confirmed on-chain");
-            printedDeposit = true;
-          }
-
-          // Print deployment ID
-          if (!printedDeploymentId && deployment.deploymentId) {
-            console.log(`  ✓ Deployment created: ${deployment.deploymentId}`);
-            printedDeploymentId = true;
-          }
-
-          // Print dseq when it appears
-          if (!printedDseq && akash.dseq && akash.dseq !== lastDseq) {
-            console.log(`  ✓ Akash deployment broadcasted (dseq: ${akash.dseq})`);
-            printedDseq = true;
-            lastDseq = akash.dseq;
-          }
-
-          // Print waiting for bids
-          if (printedDseq && !printedProvider && !printedWaitingBids) {
-            console.log(`  ⏳ Waiting for provider bids...`);
-            printedWaitingBids = true;
-          }
-
-          // Print provider selected
-          if (!printedProvider && akash.provider && akash.provider !== lastProvider) {
-            console.log(`  ✓ Provider selected: ${akash.provider}`);
-            printedProvider = true;
-            lastProvider = akash.provider;
-          }
-
-          // Print lease created
-          if (!printedLease && akash.leaseId && akash.leaseId !== lastLeaseId) {
-            console.log(`  ✓ Lease created with provider`);
-            printedLease = true;
-            lastLeaseId = akash.leaseId;
-          }
-
-          // Print manifest sent (infer from having lease but not yet running)
-          if (printedLease && !printedManifest && deployment.status === "deploying") {
-            console.log(`  ⏳ Sending manifest & starting container...`);
-            printedManifest = true;
-          }
-
-          // Check for terminal states
-          if (deployment.status === "running") {
-            console.log("  ✓ Container is RUNNING!");
-
-            if (deployment.escrowProofTx) {
-              console.log(`  ✓ Escrow proof submitted - funds released`);
-            }
-
-            const endpointLines = deployment.endpoints && deployment.endpoints.length > 0
-              ? deployment.endpoints.map(ep => `    ${ep.protocol}://${ep.host}:${ep.port}`).join("\n")
-              : "    (endpoints still provisioning - check status again)";
-
-            console.log(`
-
-╔═══════════════════════════════════════════════════════════════╗
-║                  Deployment Complete!                         ║
-╚═══════════════════════════════════════════════════════════════╝
-
-  Deployment ID: ${deployment.deploymentId}
-  Akash dseq:    ${akash.dseq || "N/A"}
-  Provider:      ${akash.provider || "N/A"}
-
-  Endpoints:
-${endpointLines}
-
-  Expires: ${new Date(deployment.expiresAt).toISOString()}
-${deployment.escrowProofTx ? `\n  Escrow tx: ${deployment.escrowProofTx}` : ""}
-`);
-            process.exit(0);
-          }
-
-          if (deployment.status === "failed") {
-            console.log("  ✗ Deployment FAILED");
-
-            console.log(`
-
-╔═══════════════════════════════════════════════════════════════╗
-║                  Deployment Failed                            ║
-╚═══════════════════════════════════════════════════════════════╝
-
-  Deployment ID: ${deployment.deploymentId}
-${deployment.escrowProofTx ? `  Refund tx: ${deployment.escrowProofTx}` : ""}
-
-  Your deposit has been automatically refunded via escrow.
-  You can try again with different specs.
-`);
-            process.exit(1);
-          }
-        }
-      } catch {
-        // Polling error - continue
+      if (!status.deployment) {
+        console.log(`No deployment found with DSEQ ${dseqArg}`);
+        process.exit(1);
       }
 
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      const stateMap: Record<number, string> = {
+        0: "Invalid",
+        1: "Active",
+        2: "Closed",
+      };
+
+      console.log(`DSEQ: ${dseqArg}`);
+      console.log(`Owner: ${address}`);
+      console.log(`State: ${stateMap[status.deployment.state] || "Unknown"}`);
+      console.log(`Status: ${status.status}`);
+      console.log(`Created: ${status.deployment.createdAt}`);
+
+      if (status.leases.length > 0) {
+        console.log("\nLeases:");
+        for (const lease of status.leases) {
+          const leaseStateMap: Record<number, string> = {
+            0: "Invalid",
+            1: "Active",
+            2: "Insufficient Funds",
+            3: "Closed",
+          };
+          console.log(`  GSEQ ${lease.leaseId.gseq}: ${leaseStateMap[lease.state] || "Unknown"}`);
+          console.log(`    Provider: ${lease.leaseId.provider}`);
+        }
+      }
+
+      if (status.endpoints.length > 0) {
+        console.log("\nEndpoints:");
+        for (const ep of status.endpoints) {
+          console.log(`  ${ep.uri}`);
+        }
+      }
+    } catch (error) {
+      console.error("Failed to fetch status:", error);
+      process.exit(1);
     }
-
-    // Timeout
+  } else {
+    // Show all deployments
     console.log(`
-
-Timed out waiting for deployment status.
-The deployment may still be in progress.
-
-Check status in Claude Code by saying "check my deployment"
-or run: npx @agent-pay/mcp escrow-status <escrowId>
-`);
-
-  } catch (error) {
-    console.error("\nDeposit was rejected.");
-    process.exit(1);
-  }
-
-  process.exit(0);
-}
-
-// ============================================================================
-// ESCROW STATUS COMMAND
-// ============================================================================
-
-async function escrowStatus(escrowIdArg?: string) {
-  const config = loadConfig();
-  if (!config) {
-    console.error("Not set up yet. Run: npx @agent-pay/mcp setup");
-    process.exit(1);
-  }
-
-  if (!escrowIdArg) {
-    console.error("Usage: npx @agent-pay/mcp escrow-status <escrowId>");
-    process.exit(1);
-  }
-
-  console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║                    Escrow Status                              ║
+║                    All Deployments                            ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
 
-  // Get escrow contract address from gateway
-  let escrowContract: `0x${string}`;
+    try {
+      const deployments = await queryDeployments(address, network);
+
+      if (deployments.length === 0) {
+        console.log("No deployments found.");
+        process.exit(0);
+      }
+
+      const stateMap: Record<number, string> = {
+        0: "Invalid",
+        1: "Active",
+        2: "Closed",
+      };
+
+      for (const d of deployments) {
+        console.log(`DSEQ: ${d.deploymentId.dseq}`);
+        console.log(`  State: ${stateMap[d.state] || "Unknown"}`);
+        console.log(`  Created: ${d.createdAt}`);
+        console.log("");
+      }
+    } catch (error) {
+      console.error("Failed to fetch deployments:", error);
+      process.exit(1);
+    }
+  }
+}
+
+// ============================================================================
+// BRIDGE COMMAND
+// ============================================================================
+
+async function bridge() {
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                Bridge USDC to Akash                           ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  // Parse arguments
+  const args = process.argv.slice(3);
+  const getArg = (name: string): string | undefined => {
+    const index = args.indexOf(`--${name}`);
+    return index !== -1 ? args[index + 1] : undefined;
+  };
+
+  const amount = getArg("amount") || "10";
+  const evmNetwork = getArg("evm-network") || "base";
+  const isTestnet = args.includes("--testnet");
+
+  // Get Akash address
+  const akashAddress = getDefaultWalletAddress();
+  if (!akashAddress) {
+    console.error("No Akash wallet found. Create one first:");
+    console.error("  npx @agent-pay/mcp wallet create");
+    process.exit(1);
+  }
+
+  console.log(`Bridge Details:`);
+  console.log(`  Amount: ${amount} USDC`);
+  console.log(`  From: ${evmNetwork === "base" ? "Base Mainnet" : "Base Sepolia"}`);
+  console.log(`  To: Akash (${akashAddress})`);
+  console.log(`  Include gas swap: Yes (small AKT for tx fees)`);
+  console.log("");
+
+  // Initialize WalletConnect for EVM signing
+  console.log("Connect your EVM wallet to sign the bridge transaction:\n");
+  const signClient = await initWalletConnect();
+  const { session, walletAddress } = await connectEvmWallet(signClient, evmNetwork);
+
+  console.log(`\nConnected: ${walletAddress}\n`);
+
   try {
-    const response = await fetch(`${config.gatewayUrl}/`);
-    const info = await response.json() as any;
-    escrowContract = info.escrow?.contract;
-    if (!escrowContract) {
-      console.error("Escrow contract not configured on gateway.");
+    // Create bridge route
+    console.log("Creating bridge route...\n");
+    const route = await createBridgeRoute({
+      fromAddress: walletAddress,
+      toAddress: akashAddress,
+      amountUSDC: amount,
+      network: isTestnet ? "testnet" : "mainnet",
+      includeGasSwap: true,
+    });
+
+    console.log(`Route created:`);
+    console.log(`  Estimated received: ${route.estimatedReceived} USDC`);
+    console.log(`  Bridge fee: ${route.fees.bridgeFee} USDC`);
+    console.log(`  Gas fee: ${route.fees.gasFee} USDC`);
+    console.log(`  Estimated time: ${route.estimatedTime}s`);
+    console.log("");
+
+    // Check if approval is needed
+    if (route.approvalNeeded && route.approvalAddress) {
+      console.log("Step 1/2: Approving USDC spending...\n");
+
+      const approveData = encodeFunctionData({
+        abi: APPROVE_ABI,
+        functionName: "approve",
+        args: [route.approvalAddress as `0x${string}`, parseUnits(amount, 6)],
+      });
+
+      const chainId = CHAIN_IDS[evmNetwork] || CHAIN_IDS["base"];
+      const usdcAddress = USDC_ADDRESSES[evmNetwork] || USDC_ADDRESSES["base"];
+
+      try {
+        const approveTxHash = await signClient.request({
+          topic: session.topic,
+          chainId,
+          request: {
+            method: "eth_sendTransaction",
+            params: [
+              {
+                from: walletAddress,
+                to: usdcAddress,
+                data: approveData,
+              },
+            ],
+          },
+        });
+
+        console.log(`Approval submitted: ${approveTxHash}`);
+        console.log("Waiting for confirmation...\n");
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      } catch (error) {
+        console.error("Approval rejected.");
+        process.exit(1);
+      }
+    }
+
+    // Execute bridge transaction
+    console.log(`${route.approvalNeeded ? "Step 2/2" : "Step 1/1"}: Executing bridge...\n`);
+    console.log("Check your wallet to confirm the bridge transaction.\n");
+
+    const chainId = CHAIN_IDS[evmNetwork] || CHAIN_IDS["base"];
+
+    try {
+      const bridgeTxHash = (await signClient.request({
+        topic: session.topic,
+        chainId,
+        request: {
+          method: "eth_sendTransaction",
+          params: [
+            {
+              from: walletAddress,
+              to: route.transactionRequest.to,
+              data: route.transactionRequest.data,
+              value: route.transactionRequest.value,
+            },
+          ],
+        },
+      })) as string;
+
+      console.log(`Bridge transaction submitted: ${bridgeTxHash}\n`);
+
+      // Disconnect wallet
+      await signClient.disconnect({
+        topic: session.topic,
+        reason: { code: 6000, message: "Bridge initiated" },
+      });
+
+      // Wait for bridge completion
+      console.log("Waiting for bridge completion...\n");
+      const status = await waitForBridgeCompletion(
+        bridgeTxHash,
+        route.routeId,
+        isTestnet ? "testnet" : "mainnet"
+      );
+
+      if (status.status === "success") {
+        console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Bridge Complete!                             ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Amount: ${amount} USDC
+  Received: ~${route.estimatedReceived} axlUSDC
+  To: ${akashAddress}
+  TX: ${bridgeTxHash}
+
+Your Akash wallet is now funded! You can deploy compute:
+  npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04
+`);
+      } else if (status.status === "failed") {
+        console.error(`\nBridge failed: ${status.error}`);
+        console.error("Funds should be returned to your source wallet.");
+        process.exit(1);
+      } else {
+        console.log(`
+Bridge is still processing (may take 2-5 minutes).
+Transaction: ${bridgeTxHash}
+
+Check your Akash wallet balance:
+  npx @agent-pay/mcp wallet balance
+`);
+      }
+    } catch (error) {
+      console.error("Bridge transaction rejected.");
       process.exit(1);
     }
   } catch (error) {
-    console.error("Failed to fetch gateway info.");
+    console.error("Bridge failed:", error);
     process.exit(1);
   }
+}
 
-  // Read escrow status from chain
-  const chain = CHAINS[config.network] || CHAINS["base"];
-  const client = createPublicClient({
-    chain,
-    transport: http(),
-  });
+// ============================================================================
+// HELP COMMAND
+// ============================================================================
 
-  try {
-    const result = await client.readContract({
-      address: escrowContract,
-      abi: ESCROW_READ_ABI,
-      functionName: "escrows",
-      args: [escrowIdArg as Hex],
-    }) as [string, bigint, bigint, Hex, bigint, number, string, string, bigint];
+function showHelp() {
+  console.log(`
+Agent-Pay CLI - Trustless Compute Provisioning
 
-    const [user, depositAmount, quotedAmount, specsHash, createdAt, status, akashDseq, akashProvider, actualCost] = result;
+Commands:
+  wallet create              Create a new Akash wallet
+  wallet list                List all stored wallets
+  wallet balance [address]   Check wallet balance
 
-    const statusNames = ["None", "Deposited", "Released", "Refunded"];
-    const statusName = statusNames[status] || "Unknown";
+  deploy                     Deploy to Akash Network
+    --cpu <n>                CPU cores (default: 1)
+    --memory <size>          Memory (default: 1Gi)
+    --storage <size>         Storage (default: 5Gi)
+    --image <image>          Docker image (default: ubuntu:22.04)
+    --hours <n>              Duration in hours (default: 1)
+    --port <port>[/proto]    Port to expose (can be repeated)
+    --env <key=value>        Environment variable (can be repeated)
+    --gpu-count <n>          Number of GPUs
+    --gpu-model <model>      GPU model
+    --testnet                Use testnet
 
-    const depositUsd = (Number(depositAmount) / 1_000_000).toFixed(2);
-    const quotedUsd = (Number(quotedAmount) / 1_000_000).toFixed(2);
-    const actualUsd = (Number(actualCost) / 1_000_000).toFixed(2);
+  close <dseq>               Close a deployment
+    --testnet                Use testnet
 
-    console.log(`Escrow ID: ${escrowIdArg}`);
-    console.log(`Status: ${statusName}`);
-    console.log(`User: ${user}`);
-    console.log(`Deposit: $${depositUsd} USDC`);
-    console.log(`Quoted: $${quotedUsd} USDC`);
+  status [dseq]              Check deployment status
+    --testnet                Use testnet
 
-    if (status === 2) { // Released
-      console.log(`Actual Cost: $${actualUsd} USDC`);
-      const refund = Number(depositAmount - actualCost) / 1_000_000;
-      console.log(`Refund: $${refund.toFixed(2)} USDC`);
-    }
+  bridge                     Bridge USDC from Base to Akash
+    --amount <usdc>          Amount to bridge (default: 10)
+    --evm-network <network>  EVM network: base or base-sepolia
+    --testnet                Use Akash testnet
 
-    if (akashDseq) {
-      console.log(`\nAkash Deployment:`);
-      console.log(`  DSEQ: ${akashDseq}`);
-      console.log(`  Provider: ${akashProvider}`);
-    }
-
-    console.log(`\nCreated: ${new Date(Number(createdAt) * 1000).toISOString()}`);
-
-  } catch (error) {
-    console.error("Failed to read escrow status:", error);
-    process.exit(1);
-  }
+Examples:
+  npx @agent-pay/mcp wallet create
+  npx @agent-pay/mcp wallet balance
+  npx @agent-pay/mcp bridge --amount 10
+  npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04 --port 22
+  npx @agent-pay/mcp status 12345678
+  npx @agent-pay/mcp close 12345678
+`);
 }
 
 // ============================================================================
@@ -904,55 +847,51 @@ async function escrowStatus(escrowIdArg?: string) {
 // ============================================================================
 
 const command = process.argv[2];
-const arg = process.argv[3];
+const subcommand = process.argv[3];
 
-if (command === "setup") {
-  setup().catch((error) => {
-    console.error("Setup failed:", error);
+if (command === "wallet") {
+  if (subcommand === "create") {
+    walletCreate().catch((error) => {
+      console.error("Failed:", error);
+      process.exit(1);
+    });
+  } else if (subcommand === "list") {
+    walletList().catch((error) => {
+      console.error("Failed:", error);
+      process.exit(1);
+    });
+  } else if (subcommand === "balance") {
+    walletBalance(process.argv[4]).catch((error) => {
+      console.error("Failed:", error);
+      process.exit(1);
+    });
+  } else {
+    console.error(`Unknown wallet command: ${subcommand}`);
+    console.error("Available: wallet create, wallet list, wallet balance");
+    process.exit(1);
+  }
+} else if (command === "deploy") {
+  deploy().catch((error) => {
+    console.error("Deploy failed:", error);
     process.exit(1);
   });
-} else if (command === "approve") {
-  approve(arg).catch((error) => {
-    console.error("Approval failed:", error);
+} else if (command === "close") {
+  close(subcommand).catch((error) => {
+    console.error("Close failed:", error);
     process.exit(1);
   });
 } else if (command === "status") {
-  status().catch((error) => {
+  statusCmd(subcommand).catch((error) => {
     console.error("Status check failed:", error);
     process.exit(1);
   });
-} else if (command === "deposit") {
-  deposit(arg).catch((error) => {
-    console.error("Deposit failed:", error);
-    process.exit(1);
-  });
-} else if (command === "escrow-status") {
-  escrowStatus(arg).catch((error) => {
-    console.error("Escrow status check failed:", error);
+} else if (command === "bridge") {
+  bridge().catch((error) => {
+    console.error("Bridge failed:", error);
     process.exit(1);
   });
 } else if (command === "--help" || command === "-h" || !command) {
-  console.log(`
-Agent-Pay CLI
-
-Commands:
-  setup                      Connect your wallet and configure agent-pay
-  approve <amount>           Approve USDC spending (e.g., approve 50 for $50)
-  status                     Check your wallet balance and spending limit
-  deposit <quoteId>          Deposit into escrow for a quote
-  escrow-status <escrowId>   Check escrow status on-chain
-
-Usage:
-  npx @agent-pay/mcp setup
-  npx @agent-pay/mcp approve 100
-  npx @agent-pay/mcp status
-  npx @agent-pay/mcp deposit quote_abc123
-  npx @agent-pay/mcp escrow-status 0x...
-
-Environment variables:
-  AGENT_PAY_GATEWAY_URL    Gateway URL (default: https://gateway.agentpay.dev)
-  AGENT_PAY_NETWORK        Network: "base" or "base-sepolia" (default: base)
-`);
+  showHelp();
 } else {
   console.error(`Unknown command: ${command}`);
   console.error('Run "npx @agent-pay/mcp --help" for usage.');
