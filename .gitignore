@@ -8,6 +8,8 @@ dist/
 build/
 *.wasm
 
+phases-plan.md
+
 # Environment files (contain secrets)
 .env
 .env.local
@@ -44,8 +46,8 @@ tmp/
 temp/
 *.tmp
 
-# Lock files (optional - uncomment if you want to ignore)
-# package-lock.json
+# Lock files
+package-lock.json
 # yarn.lock
 
 # CRE build artifacts

@@ -5,10 +5,8 @@
  * Handles queries and transaction broadcasting with user wallet signing.
  */
 
-import { StargateClient, SigningStargateClient, GasPrice, coins } from "@cosmjs/stargate";
+import { StargateClient, SigningStargateClient, GasPrice } from "@cosmjs/stargate";
 import { DirectSecp256k1HdWallet, Registry } from "@cosmjs/proto-signing";
-import { MsgCreateDeployment, MsgCloseDeployment } from "@akashnetwork/akash-api/akash/deployment/v1beta3";
-import { MsgCreateLease } from "@akashnetwork/akash-api/akash/market/v1beta4";
 
 // Network configuration
 export const AKASH_RPC_ENDPOINTS = {

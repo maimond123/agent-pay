@@ -86,7 +86,7 @@ export function registerListDeployments(server: McpServer) {
         }
 
         // Build deployment list
-        const lines = [
+        const lines: (string | null)[] = [
           `## Deployments (${statusFilter})`,
           "",
           `**Wallet:** \`${owner}\``,
@@ -126,7 +126,7 @@ export function registerListDeployments(server: McpServer) {
         }
 
         // Filter out null entries
-        const filteredLines = lines.filter((l) => l !== null);
+        const filteredLines = lines.filter((l): l is string => l !== null);
 
         // Add management commands
         if (statusFilter === "active" && deployments.length > 0) {

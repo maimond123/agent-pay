@@ -32,7 +32,8 @@ import {
   getDeploymentStatus,
   queryDeployments,
 } from "./akash/index.js";
-import { createBridgeRoute, getBridgeStatus, waitForBridgeCompletion } from "./bridge/index.js";
+import { createSkipBridge, trackSkipTransaction, waitForSkipBridgeCompletion, SKIP_CHAINS } from "./bridge/index.js";
+import { fromBech32, toBech32 } from "@cosmjs/encoding";
 import type { ComputeSpecs } from "./types.js";
 
 // Configuration
@@ -56,8 +57,8 @@ const CHAIN_IDS: Record<string, string> = {
   "base": "eip155:8453",
 };
 
-// ERC20 approve function ABI
-const APPROVE_ABI = [
+// ERC20 ABI for approve, allowance, and balanceOf
+const ERC20_ABI = [
   {
     name: "approve",
     type: "function",
@@ -68,7 +69,27 @@ const APPROVE_ABI = [
     ],
     outputs: [{ name: "", type: "bool" }],
   },
+  {
+    name: "allowance",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    name: "balanceOf",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "account", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
 ] as const;
+
 
 // Config file path
 const CONFIG_DIR = join(homedir(), ".agent-pay");
@@ -621,13 +642,44 @@ async function statusCmd(dseqArg?: string) {
 }
 
 // ============================================================================
-// BRIDGE COMMAND
+// BRIDGE HELPERS
+// ============================================================================
+
+const COSMOS_PREFIXES: Record<string, string> = {
+  "akashnet-2": "akash",
+  "noble-1": "noble",
+  "osmosis-1": "osmo",
+  "cosmoshub-4": "cosmos",
+};
+
+/**
+ * Print the user's derived addresses on intermediate Cosmos chains.
+ * Useful when a bridge fails or times out so the user can check where funds landed.
+ */
+function printIntermediateAddresses(akashAddress: string, chainPath: string[]) {
+  console.log("\nCheck your balances on intermediate chains:");
+  for (const chainId of chainPath) {
+    const prefix = COSMOS_PREFIXES[chainId];
+    if (!prefix) continue; // skip EVM chains
+    try {
+      const { data } = fromBech32(akashAddress);
+      const addr = toBech32(prefix, data);
+      const label = chainId.split("-")[0].charAt(0).toUpperCase() + chainId.split("-")[0].slice(1);
+      console.log(`  ${label.padEnd(10)} ${addr}`);
+    } catch {
+      // skip if conversion fails
+    }
+  }
+}
+
+// ============================================================================
+// BRIDGE COMMAND (Skip Go API - Low Fees)
 // ============================================================================
 
 async function bridge() {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
-║                Bridge USDC to Akash                           ║
+║           Bridge USDC to Akash (via Skip Go)                  ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
 
@@ -640,7 +692,7 @@ async function bridge() {
 
   const amount = getArg("amount") || "10";
   const evmNetwork = getArg("evm-network") || "base";
-  const isTestnet = args.includes("--testnet");
+  const destinationType = (getArg("receive") || "akt") as "akt" | "usdc";
 
   // Get Akash address
   const akashAddress = getDefaultWalletAddress();
@@ -652,9 +704,11 @@ async function bridge() {
 
   console.log(`Bridge Details:`);
   console.log(`  Amount: ${amount} USDC`);
-  console.log(`  From: ${evmNetwork === "base" ? "Base Mainnet" : "Base Sepolia"}`);
+  console.log(`  From: Base Mainnet`);
   console.log(`  To: Akash (${akashAddress})`);
-  console.log(`  Include gas swap: Yes (small AKT for tx fees)`);
+  console.log(`  Receive: ${destinationType.toUpperCase()}`);
+  console.log(`  Bridge: Skip Go (Noble CCTP + IBC)`);
+  console.log(`  Estimated fee: ~$0.02`);
   console.log("");
 
   // Initialize WalletConnect for EVM signing
@@ -665,35 +719,96 @@ async function bridge() {
   console.log(`\nConnected: ${walletAddress}\n`);
 
   try {
-    // Create bridge route
-    console.log("Creating bridge route...\n");
-    const route = await createBridgeRoute({
+    // Create bridge route using Skip Go API
+    console.log("Creating bridge route via Skip Go...\n");
+    const bridgeResult = await createSkipBridge({
       fromAddress: walletAddress,
       toAddress: akashAddress,
       amountUSDC: amount,
-      network: isTestnet ? "testnet" : "mainnet",
-      includeGasSwap: true,
+      destinationType,
+      slippagePercent: "3",
     });
 
+    const { route, transactions } = bridgeResult;
+
+    // Format the output amount
+    const outputAmount = (parseInt(route.estimatedAmountOut) / 1_000_000).toFixed(6);
+    const outputToken = destinationType === "akt" ? "AKT" : "USDC";
+
     console.log(`Route created:`);
-    console.log(`  Estimated received: ${route.estimatedReceived} USDC`);
-    console.log(`  Bridge fee: ${route.fees.bridgeFee} USDC`);
-    console.log(`  Gas fee: ${route.fees.gasFee} USDC`);
-    console.log(`  Estimated time: ${route.estimatedTime}s`);
+    console.log(`  Estimated received: ${outputAmount} ${outputToken}`);
+    console.log(`  Total fees: $${route.fees.totalUsd}`);
+    console.log(`  Estimated time: ~${Math.round(route.estimatedDurationSeconds / 60)} minutes`);
+    console.log(`  Route: ${route.chainPath.join(" → ")}`);
+    console.log(`  Transactions required: ${route.txsRequired}`);
     console.log("");
 
-    // Check if approval is needed
-    if (route.approvalNeeded && route.approvalAddress) {
-      console.log("Step 1/2: Approving USDC spending...\n");
+    // Get the first EVM transaction (the one on Base)
+    const evmTx = transactions.find(tx => tx.txType === "evm" && tx.evmTx);
+    if (!evmTx?.evmTx) {
+      throw new Error("No EVM transaction found in route");
+    }
+
+    const chainId = CHAIN_IDS[evmNetwork] || CHAIN_IDS["base"];
+    const usdcAddress = USDC_ADDRESSES[evmNetwork] || USDC_ADDRESSES["base"];
+    const chain = CHAINS[evmNetwork] || CHAINS["base"];
+    const amountInMicro = parseUnits(amount, 6);
+
+    // Check current USDC balance and allowance for the Skip contract
+    const skipContractAddress = evmTx.evmTx.to as `0x${string}`;
+    console.log("Checking USDC balance and allowance...\n");
+    const publicClient = createPublicClient({
+      chain,
+      transport: http(),
+    });
+
+    // Check balance first
+    const currentBalance = await publicClient.readContract({
+      address: usdcAddress,
+      abi: ERC20_ABI,
+      functionName: "balanceOf",
+      args: [walletAddress],
+    });
+
+    const balanceFormatted = Number(currentBalance) / 1e6;
+    console.log(`  USDC Balance: ${balanceFormatted.toFixed(6)} USDC`);
+
+    if (currentBalance < amountInMicro) {
+      console.error(`\nInsufficient USDC balance!`);
+      console.error(`  You have: ${balanceFormatted.toFixed(6)} USDC`);
+      console.error(`  Required: ${amount} USDC`);
+      console.error(`\nPlease add more USDC to your wallet: ${walletAddress}`);
+      process.exit(1);
+    }
+
+    // Check allowance
+    const currentAllowance = await publicClient.readContract({
+      address: usdcAddress,
+      abi: ERC20_ABI,
+      functionName: "allowance",
+      args: [walletAddress, skipContractAddress],
+    });
+
+    const allowanceFormatted = Number(currentAllowance) / 1e6;
+    console.log(`  USDC Allowance: ${allowanceFormatted.toFixed(6)} USDC (for Skip contract)`);
+    console.log("");
+
+    const needsApproval = currentAllowance < amountInMicro;
+
+    if (needsApproval) {
+      console.log(`Allowance is less than bridge amount. Need to approve first.`);
+      console.log("\nStep 1/2: Approving USDC spending...\n");
+      console.log("Check your wallet to approve the USDC spending.");
+      console.log("(If your wallet takes too long, you may need to manually accept)\n");
+
+      // Approve max uint256 so user doesn't need to approve again
+      const maxApproval = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
       const approveData = encodeFunctionData({
-        abi: APPROVE_ABI,
+        abi: ERC20_ABI,
         functionName: "approve",
-        args: [route.approvalAddress as `0x${string}`, parseUnits(amount, 6)],
+        args: [skipContractAddress, maxApproval],
       });
-
-      const chainId = CHAIN_IDS[evmNetwork] || CHAIN_IDS["base"];
-      const usdcAddress = USDC_ADDRESSES[evmNetwork] || USDC_ADDRESSES["base"];
 
       try {
         const approveTxHash = await signClient.request({
@@ -712,19 +827,30 @@ async function bridge() {
         });
 
         console.log(`Approval submitted: ${approveTxHash}`);
-        console.log("Waiting for confirmation...\n");
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-      } catch (error) {
-        console.error("Approval rejected.");
+        console.log("Waiting for confirmation (15 seconds)...\n");
+        await new Promise((resolve) => setTimeout(resolve, 15000));
+      } catch (error: any) {
+        const errorMsg = error?.message || String(error);
+        if (errorMsg.includes("timeout") || errorMsg.includes("TIMEOUT")) {
+          console.error("\nWalletConnect request timed out.");
+          console.error("This usually means:");
+          console.error("  1. The transaction wasn't approved in time on your wallet");
+          console.error("  2. Your wallet app may have disconnected");
+          console.error("\nTry again and approve the transaction promptly in your wallet.");
+        } else if (errorMsg.includes("rejected") || errorMsg.includes("denied")) {
+          console.error("\nApproval was rejected in your wallet.");
+        } else {
+          console.error("\nApproval failed:", errorMsg);
+        }
         process.exit(1);
       }
+    } else {
+      console.log(`Allowance OK: ${Number(currentAllowance) / 1e6} USDC\n`);
     }
 
     // Execute bridge transaction
-    console.log(`${route.approvalNeeded ? "Step 2/2" : "Step 1/1"}: Executing bridge...\n`);
+    console.log(`${needsApproval ? "Step 2/2" : "Step 1/1"}: Executing bridge...\n`);
     console.log("Check your wallet to confirm the bridge transaction.\n");
-
-    const chainId = CHAIN_IDS[evmNetwork] || CHAIN_IDS["base"];
 
     try {
       const bridgeTxHash = (await signClient.request({
@@ -735,9 +861,9 @@ async function bridge() {
           params: [
             {
               from: walletAddress,
-              to: route.transactionRequest.to,
-              data: route.transactionRequest.data,
-              value: route.transactionRequest.value,
+              to: evmTx.evmTx.to,
+              data: evmTx.evmTx.data,
+              value: evmTx.evmTx.value || "0x0",
             },
           ],
         },
@@ -745,19 +871,36 @@ async function bridge() {
 
       console.log(`Bridge transaction submitted: ${bridgeTxHash}\n`);
 
+      // Register with Skip's Smart Relay for tracking
+      console.log("Registering transaction with Skip relay...\n");
+      try {
+        const trackResult = await trackSkipTransaction(bridgeTxHash, SKIP_CHAINS.BASE_MAINNET);
+        console.log(`Explorer: ${trackResult.explorerLink}\n`);
+      } catch (trackError: any) {
+        console.warn(`Warning: Could not register with Skip relay: ${trackError.message}`);
+        console.warn("Will still attempt to poll for status...\n");
+      }
+
       // Disconnect wallet
       await signClient.disconnect({
         topic: session.topic,
         reason: { code: 6000, message: "Bridge initiated" },
       });
 
-      // Wait for bridge completion
+      // Wait for bridge completion with per-hop progress
       console.log("Waiting for bridge completion...\n");
-      const status = await waitForBridgeCompletion(
+
+      const status = await waitForSkipBridgeCompletion(
         bridgeTxHash,
-        route.routeId,
-        isTestnet ? "testnet" : "mainnet"
+        SKIP_CHAINS.BASE_MAINNET,
+        {
+          timeoutMs: 1800000, // 30 min timeout
+          pollIntervalMs: 15000, // Poll every 15 seconds
+          chainPath: route.chainPath,
+        }
       );
+
+      console.log(""); // newline after progress block
 
       if (status.status === "success") {
         console.log(`
@@ -765,33 +908,65 @@ async function bridge() {
 ║                  Bridge Complete!                             ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-  Amount: ${amount} USDC
-  Received: ~${route.estimatedReceived} axlUSDC
+  Sent: ${amount} USDC
+  Received: ~${outputAmount} ${outputToken}
   To: ${akashAddress}
   TX: ${bridgeTxHash}
+  Fees: ~$${route.fees.totalUsd}
 
 Your Akash wallet is now funded! You can deploy compute:
   npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04
 `);
       } else if (status.status === "failed") {
-        console.error(`\nBridge failed: ${status.error}`);
-        console.error("Funds should be returned to your source wallet.");
+        console.error(`\nBridge failed. Check transaction status at:`);
+        console.error(`  https://www.mintscan.io/`);
+        printIntermediateAddresses(akashAddress, route.chainPath);
+        console.error("\nFunds should be on one of the above chains.");
+        process.exit(1);
+      } else if (status.status === "abandoned") {
+        console.error(`\nBridge tracking was abandoned by Skip relay.`);
+        console.error("Your funds may be on an intermediate chain.");
+        printIntermediateAddresses(akashAddress, route.chainPath);
         process.exit(1);
       } else {
         console.log(`
-Bridge is still processing (may take 2-5 minutes).
+Bridge is still processing (may take up to 20 minutes).
 Transaction: ${bridgeTxHash}
 
+Track your transfer:
+  https://ibc.fun/tx/${bridgeTxHash}
+`);
+        printIntermediateAddresses(akashAddress, route.chainPath);
+        console.log(`
 Check your Akash wallet balance:
   npx @agent-pay/mcp wallet balance
 `);
       }
-    } catch (error) {
-      console.error("Bridge transaction rejected.");
+    } catch (error: any) {
+      const errorMsg = error?.message || String(error);
+      if (errorMsg.includes("timeout") || errorMsg.includes("TIMEOUT")) {
+        console.error("\nWalletConnect request timed out.");
+        console.error("This usually means:");
+        console.error("  1. The transaction wasn't approved in time on your wallet");
+        console.error("  2. Your wallet app may have disconnected");
+        console.error("\nTry again and approve the transaction promptly in your wallet.");
+      } else if (errorMsg.includes("rejected") || errorMsg.includes("denied")) {
+        console.error("\nBridge transaction was rejected in your wallet.");
+      } else {
+        console.error("\nBridge transaction failed:", errorMsg);
+      }
       process.exit(1);
     }
-  } catch (error) {
-    console.error("Bridge failed:", error);
+  } catch (error: any) {
+    const errorMsg = error?.message || String(error);
+    if (errorMsg.includes("relay") || errorMsg.includes("FAILED_TIMEOUT")) {
+      console.error("\nSkip Go relay timed out. This can happen if:");
+      console.error("  1. The Skip API is experiencing high traffic");
+      console.error("  2. There's a network congestion issue");
+      console.error("\nPlease try again in a few minutes.");
+    } else {
+      console.error("\nBridge failed:", errorMsg);
+    }
     process.exit(1);
   }
 }
@@ -827,10 +1002,9 @@ Commands:
   status [dseq]              Check deployment status
     --testnet                Use testnet
 
-  bridge                     Bridge USDC from Base to Akash
+  bridge                     Bridge USDC from Base to Akash (via Skip Go)
     --amount <usdc>          Amount to bridge (default: 10)
-    --evm-network <network>  EVM network: base or base-sepolia
-    --testnet                Use Akash testnet
+    --receive <token>        Token to receive: akt or usdc (default: akt)
 
 Examples:
   npx @agent-pay/mcp wallet create

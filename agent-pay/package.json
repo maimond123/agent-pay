@@ -35,18 +35,19 @@
   },
   "license": "MIT",
   "dependencies": {
+    "@0xsquid/sdk": "^2.9.3",
+    "@0xsquid/squid-types": "^0.1.210",
+    "@akashnetwork/akashjs": "^1.0.0",
+    "@cosmjs/crypto": "^0.32.0",
+    "@cosmjs/encoding": "^0.32.0",
+    "@cosmjs/proto-signing": "^0.32.0",
+    "@cosmjs/stargate": "^0.32.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@walletconnect/sign-client": "^2.17.0",
     "@walletconnect/types": "^2.17.0",
-    "@cosmjs/proto-signing": "^0.32.0",
-    "@cosmjs/stargate": "^0.32.0",
-    "@cosmjs/crypto": "^0.32.0",
-    "@cosmjs/encoding": "^0.32.0",
-    "@akashnetwork/akash-api": "^0.0.74",
-    "@0xsquid/sdk": "^2.9.3",
+    "ethers": "^6.13.0",
     "qrcode-terminal": "^0.12.0",
-    "viem": "^2.21.0",
-    "ethers": "^6.13.0"
+    "viem": "^2.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
