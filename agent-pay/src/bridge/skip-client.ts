@@ -82,6 +82,33 @@ export interface SkipBridgeResult {
 
 const SKIP_API_BASE = "https://api.skip.build";
 
+// Debug logging — set SKIP_DEBUG=1 to enable verbose API logging
+const DEBUG = process.env.SKIP_DEBUG === "1";
+
+function debugLog(label: string, ...args: any[]) {
+  if (!DEBUG) return;
+  const timestamp = new Date().toISOString();
+  console.log(`\n[SKIP DEBUG ${timestamp}] ${label}`);
+  for (const arg of args) {
+    if (typeof arg === "string") {
+      console.log(`  ${arg}`);
+    } else {
+      console.log(`  ${JSON.stringify(arg, null, 2)}`);
+    }
+  }
+}
+
+async function logResponse(label: string, response: Response): Promise<string> {
+  const bodyText = await response.text();
+  debugLog(
+    `${label} — Response`,
+    `Status: ${response.status} ${response.statusText}`,
+    `Headers: ${JSON.stringify(Object.fromEntries(response.headers.entries()))}`,
+    `Body: ${bodyText.length > 2000 ? bodyText.slice(0, 2000) + "... (truncated)" : bodyText}`
+  );
+  return bodyText;
+}
+
 // Map chain IDs to their bech32 address prefixes
 const CHAIN_PREFIXES: Record<string, string> = {
   "akashnet-2": "akash",
@@ -147,6 +174,8 @@ export async function createSkipRoute(
     smart_relay: true, // Use Skip's relay service
   };
 
+  debugLog("createSkipRoute — Request", `POST ${SKIP_API_BASE}/v2/fungible/route`, requestBody);
+
   const response = await fetch(`${SKIP_API_BASE}/v2/fungible/route`, {
     method: "POST",
     headers: {
@@ -155,12 +184,15 @@ export async function createSkipRoute(
     body: JSON.stringify(requestBody),
   });
 
+  const rawBody = await logResponse("createSkipRoute", response);
+
   if (!response.ok) {
-    const error = await response.json();
+    let error: any = {};
+    try { error = JSON.parse(rawBody); } catch {}
     throw new Error(`Skip API error: ${error.message || response.statusText}`);
   }
 
-  const data = await response.json();
+  const data = JSON.parse(rawBody);
 
   // Parse fees
   const fees = data.estimated_fees || [];
@@ -226,6 +258,8 @@ export async function getSkipTransactions(
     operations: route.operations,
   };
 
+  debugLog("getSkipTransactions — Request", `POST ${SKIP_API_BASE}/v2/fungible/msgs`, requestBody);
+
   const response = await fetch(`${SKIP_API_BASE}/v2/fungible/msgs`, {
     method: "POST",
     headers: {
@@ -234,12 +268,15 @@ export async function getSkipTransactions(
     body: JSON.stringify(requestBody),
   });
 
+  const rawBody = await logResponse("getSkipTransactions", response);
+
   if (!response.ok) {
-    const error = await response.json();
+    let error: any = {};
+    try { error = JSON.parse(rawBody); } catch {}
     throw new Error(`Skip API error: ${error.message || response.statusText}`);
   }
 
-  const data = await response.json();
+  const data = JSON.parse(rawBody);
 
   // Parse transactions
   const transactions: SkipTransaction[] = (data.txs || []).map((tx: any) => {
@@ -311,6 +348,8 @@ export async function createSkipBridge(
     smart_relay: true,
   };
 
+  debugLog("createSkipBridge — Request", `POST ${SKIP_API_BASE}/v2/fungible/msgs_direct`, requestBody);
+
   const response = await fetch(`${SKIP_API_BASE}/v2/fungible/msgs_direct`, {
     method: "POST",
     headers: {
@@ -319,12 +358,15 @@ export async function createSkipBridge(
     body: JSON.stringify(requestBody),
   });
 
+  const rawBody = await logResponse("createSkipBridge", response);
+
   if (!response.ok) {
-    const error = await response.json();
+    let error: any = {};
+    try { error = JSON.parse(rawBody); } catch {}
     throw new Error(`Skip API error: ${error.message || response.statusText}`);
   }
 
-  const data = await response.json();
+  const data = JSON.parse(rawBody);
 
   // Parse route info
   const fees = data.route?.estimated_fees || [];
@@ -396,32 +438,73 @@ export async function createSkipBridge(
  */
 export async function trackSkipTransaction(
   txHash: string,
-  chainId: string
+  chainId: string,
+  options?: {
+    maxRetries?: number;
+    initialDelayMs?: number;
+  }
 ): Promise<{ txHash: string; explorerLink: string }> {
-  const response = await fetch(`${SKIP_API_BASE}/v2/tx/track`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      tx_hash: txHash,
-      chain_id: chainId,
-    }),
-  });
+  const maxRetries = options?.maxRetries ?? 5;
+  const initialDelayMs = options?.initialDelayMs ?? 5000;
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
+  const requestBody = {
+    tx_hash: txHash,
+    chain_id: chainId,
+  };
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Wait before each attempt so the tx has time to be indexed on-chain
+    const delayMs = attempt === 1 ? initialDelayMs : 5000;
+    debugLog(
+      `trackSkipTransaction — Attempt ${attempt}/${maxRetries}`,
+      `Waiting ${delayMs}ms for tx indexing...`
+    );
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+    debugLog("trackSkipTransaction — Request", `POST ${SKIP_API_BASE}/v2/tx/track`, requestBody);
+
+    const response = await fetch(`${SKIP_API_BASE}/v2/tx/track`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    const rawBody = await logResponse("trackSkipTransaction", response);
+
+    if (response.ok) {
+      const data = JSON.parse(rawBody);
+      debugLog("trackSkipTransaction — Parsed response", data);
+      return {
+        txHash,
+        explorerLink: data.explorer_link || `https://ibc.fun/tx/${txHash}`,
+      };
+    }
+
+    // Parse the error
+    let error: any = {};
+    try { error = JSON.parse(rawBody); } catch {}
+    const errorMsg = error.message || error.code || response.statusText;
+
+    // If 404 "not found", the tx isn't indexed yet — retry
+    if (response.status === 404 && attempt < maxRetries) {
+      debugLog(
+        `trackSkipTransaction — tx not found yet (attempt ${attempt}/${maxRetries}), will retry...`
+      );
+      process.stdout.write(
+        `  Waiting for tx to be indexed on-chain (attempt ${attempt}/${maxRetries})...\n`
+      );
+      continue;
+    }
+
     throw new Error(
-      `Failed to register tx with Skip relay: ${(error as any).message || response.statusText}`
+      `Failed to register tx with Skip relay: ${errorMsg} (HTTP ${response.status})`
     );
   }
 
-  const data = await response.json();
-
-  return {
-    txHash,
-    explorerLink: data.explorer_link || `https://ibc.fun/tx/${txHash}`,
-  };
+  // Should not be reached, but just in case
+  throw new Error("Failed to register tx with Skip relay: max retries exceeded");
 }
 
 export interface SkipTransferDetail {
@@ -448,17 +531,20 @@ export async function getSkipTransactionStatus(
   txHash: string,
   chainId: string
 ): Promise<SkipTransactionStatusResult> {
-  const response = await fetch(
-    `${SKIP_API_BASE}/v2/tx/status?tx_hash=${txHash}&chain_id=${chainId}`,
-    {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    }
-  );
+  const url = `${SKIP_API_BASE}/v2/tx/status?tx_hash=${txHash}&chain_id=${chainId}`;
+  debugLog("getSkipTransactionStatus — Request", `GET ${url}`);
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+
+  const rawBody = await logResponse("getSkipTransactionStatus", response);
 
   if (!response.ok) {
+    debugLog("getSkipTransactionStatus — Non-OK response, treating as pending", `HTTP ${response.status}`);
     return {
       status: "pending",
       state: "STATE_PENDING",
@@ -466,17 +552,44 @@ export async function getSkipTransactionStatus(
     };
   }
 
-  const data = await response.json();
+  const data = JSON.parse(rawBody);
 
-  // Parse per-hop transfer details from transfer_sequence
-  const transfers = data.transfers || [];
-  const transferDetails: SkipTransferDetail[] = transfers.map(
-    (t: any, i: number) => ({
-      hopIndex: i,
-      fromChain: t.from_chain_id || t.src_chain_id || "",
-      toChain: t.to_chain_id || t.dst_chain_id || "",
-      state: t.state || "TRANSFER_UNKNOWN",
-    })
+  // Parse per-hop transfer details from the top-level transfer_sequence.
+  // Each entry is an object with exactly one key: "cctp_transfer", "ibc_transfer",
+  // "axelar_transfer", etc. The value contains src_chain_id, dst_chain_id, and state.
+  const transferSequence: any[] = data.transfer_sequence || [];
+
+  debugLog("getSkipTransactionStatus — Parsed", {
+    state: data.state,
+    transfer_sequence_count: transferSequence.length,
+    transfer_sequence: transferSequence.map((entry: any) => {
+      const hop = entry.cctp_transfer || entry.ibc_transfer || entry.axelar_transfer || entry.hyperlane_transfer || {};
+      return {
+        type: entry.cctp_transfer ? "cctp" : entry.ibc_transfer ? "ibc" : "other",
+        src_chain_id: hop.src_chain_id || hop.from_chain_id,
+        dst_chain_id: hop.dst_chain_id || hop.to_chain_id,
+        state: hop.state,
+      };
+    }),
+    transfer_asset_release: data.transfer_asset_release,
+  });
+
+  const transferDetails: SkipTransferDetail[] = transferSequence.map(
+    (entry: any, i: number) => {
+      // Extract the inner transfer object — could be cctp_transfer, ibc_transfer, etc.
+      const hop =
+        entry.cctp_transfer ||
+        entry.ibc_transfer ||
+        entry.axelar_transfer ||
+        entry.hyperlane_transfer ||
+        {};
+      return {
+        hopIndex: i,
+        fromChain: hop.src_chain_id || hop.from_chain_id || "",
+        toChain: hop.dst_chain_id || hop.to_chain_id || "",
+        state: normalizeHopState(hop.state || ""),
+      };
+    }
   );
 
   // Parse asset release info (where funds are if stuck)
@@ -488,7 +601,7 @@ export async function getSkipTransactionStatus(
     };
   }
 
-  // Map Skip state enums to our status
+  // Map Skip's top-level state to our status
   const rawState: string = data.state || "STATE_PENDING";
   let status: SkipTransactionStatusResult["status"] = "pending";
 
@@ -498,21 +611,9 @@ export async function getSkipTransactionStatus(
     status = "failed";
   } else if (rawState === "STATE_ABANDONED") {
     status = "abandoned";
-  } else {
-    // Also check individual transfer states as a fallback
-    const allSuccess =
-      transfers.length > 0 &&
-      transfers.every((t: any) => t.state === "TRANSFER_SUCCESS");
-    const anyFailed = transfers.some(
-      (t: any) => t.state === "TRANSFER_FAILURE"
-    );
-
-    if (allSuccess) {
-      status = "success";
-    } else if (anyFailed) {
-      status = "failed";
-    }
   }
+
+  debugLog("getSkipTransactionStatus — Result", { status, state: rawState, transferDetails, assetRelease });
 
   return { status, state: rawState, transferDetails, assetRelease };
 }
@@ -540,17 +641,40 @@ function formatElapsed(ms: number): string {
   return min > 0 ? `${min}m ${sec.toString().padStart(2, "0")}s` : `${sec}s`;
 }
 
+/**
+ * Normalize per-protocol hop states into a consistent set.
+ * Skip uses different state enums per bridge type:
+ *   CCTP: CCTP_TRANSFER_SENT, CCTP_TRANSFER_PENDING_CONFIRMATION, CCTP_TRANSFER_COMPLETE
+ *   IBC:  IBC_TRANSFER_PENDING, IBC_TRANSFER_COMPLETE, IBC_TRANSFER_FAILED
+ *   Axelar: AXELAR_TRANSFER_PENDING_CONFIRMATION, AXELAR_TRANSFER_COMPLETE, etc.
+ * We normalize them all to: TRANSFER_PENDING | TRANSFER_SUCCESS | TRANSFER_FAILURE
+ */
+function normalizeHopState(state: string): string {
+  if (!state) return "TRANSFER_UNKNOWN";
+
+  const s = state.toUpperCase();
+
+  // Success states
+  if (s.includes("COMPLETE") || s.includes("SUCCESS") || s.includes("RECEIVED")) {
+    return "TRANSFER_SUCCESS";
+  }
+  // Failure states
+  if (s.includes("FAIL") || s.includes("ERROR")) {
+    return "TRANSFER_FAILURE";
+  }
+  // In-progress states (sent, pending, confirming, etc.)
+  if (s.includes("PENDING") || s.includes("SENT") || s.includes("CONFIRM")) {
+    return "TRANSFER_PENDING";
+  }
+  // Fallback — treat as pending if it has any value
+  return "TRANSFER_PENDING";
+}
+
 function getHopIcon(state: string): string {
   if (state === "TRANSFER_SUCCESS") return "\u2713"; // ✓
-  if (
-    state === "TRANSFER_FAILURE" ||
-    state === "TRANSFER_UNKNOWN"
-  )
+  if (state === "TRANSFER_FAILURE" || state === "TRANSFER_UNKNOWN")
     return "\u2717"; // ✗
-  if (
-    state === "TRANSFER_PENDING" ||
-    state === "TRANSFER_RECEIVED"
-  )
+  if (state === "TRANSFER_PENDING" || state === "TRANSFER_RECEIVED")
     return "\u27F3"; // ⟳
   return "\u00B7"; // · (waiting / not started)
 }
@@ -577,10 +701,21 @@ export async function waitForSkipBridgeCompletion(
   const pollIntervalMs = options?.pollIntervalMs ?? 10000; // 10 seconds
   const chainPath = options?.chainPath ?? [];
 
+  debugLog("waitForSkipBridgeCompletion — Start", {
+    txHash,
+    chainId,
+    timeoutMs,
+    pollIntervalMs,
+    chainPath,
+  });
+
   const startTime = Date.now();
   let previousLineCount = 0;
+  let pollCount = 0;
 
   while (Date.now() - startTime < timeoutMs) {
+    pollCount++;
+    debugLog(`waitForSkipBridgeCompletion — Poll #${pollCount}`, `Elapsed: ${formatElapsed(Date.now() - startTime)}`);
     const result = await getSkipTransactionStatus(txHash, chainId);
 
     if (result.status === "success") {

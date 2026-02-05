@@ -34,6 +34,21 @@ import {
 } from "./akash/index.js";
 import { createSkipBridge, trackSkipTransaction, waitForSkipBridgeCompletion, SKIP_CHAINS } from "./bridge/index.js";
 import { fromBech32, toBech32 } from "@cosmjs/encoding";
+
+// Debug logging — set SKIP_DEBUG=1 to enable verbose logging
+const CLI_DEBUG = process.env.SKIP_DEBUG === "1";
+function cliDebug(label: string, ...args: any[]) {
+  if (!CLI_DEBUG) return;
+  const timestamp = new Date().toISOString();
+  console.log(`\n[CLI DEBUG ${timestamp}] ${label}`);
+  for (const arg of args) {
+    if (typeof arg === "string") {
+      console.log(`  ${arg}`);
+    } else {
+      console.log(`  ${JSON.stringify(arg, null, 2)}`);
+    }
+  }
+}
 import type { ComputeSpecs } from "./types.js";
 
 // Configuration
@@ -717,6 +732,13 @@ async function bridge() {
   const { session, walletAddress } = await connectEvmWallet(signClient, evmNetwork);
 
   console.log(`\nConnected: ${walletAddress}\n`);
+  cliDebug("WalletConnect session established", {
+    topic: session.topic,
+    accounts: session.namespaces.eip155?.accounts,
+    walletAddress,
+    evmNetwork,
+    chainId: CHAIN_IDS[evmNetwork] || CHAIN_IDS["base"],
+  });
 
   try {
     // Create bridge route using Skip Go API
@@ -730,6 +752,23 @@ async function bridge() {
     });
 
     const { route, transactions } = bridgeResult;
+
+    cliDebug("Bridge result received", {
+      routeId: route.routeId,
+      chainPath: route.chainPath,
+      amountIn: route.amountIn,
+      amountOut: route.amountOut,
+      estimatedAmountOut: route.estimatedAmountOut,
+      txsRequired: route.txsRequired,
+      transactionCount: transactions.length,
+      transactionTypes: transactions.map(tx => ({
+        type: tx.txType,
+        chainId: tx.chainId,
+        hasEvmTx: !!tx.evmTx,
+        hasCosmTx: !!tx.cosmosTx,
+      })),
+      fees: route.fees,
+    });
 
     // Format the output amount
     const outputAmount = (parseInt(route.estimatedAmountOut) / 1_000_000).toFixed(6);
@@ -746,6 +785,9 @@ async function bridge() {
     // Get the first EVM transaction (the one on Base)
     const evmTx = transactions.find(tx => tx.txType === "evm" && tx.evmTx);
     if (!evmTx?.evmTx) {
+      cliDebug("No EVM transaction found in route", {
+        transactions: transactions.map(tx => ({ type: tx.txType, chainId: tx.chainId })),
+      });
       throw new Error("No EVM transaction found in route");
     }
 
@@ -756,6 +798,17 @@ async function bridge() {
 
     // Check current USDC balance and allowance for the Skip contract
     const skipContractAddress = evmTx.evmTx.to as `0x${string}`;
+    cliDebug("EVM transaction details", {
+      to: evmTx.evmTx.to,
+      value: evmTx.evmTx.value,
+      dataLength: evmTx.evmTx.data?.length,
+      dataPreview: evmTx.evmTx.data?.slice(0, 74) + "...",
+      gasLimit: evmTx.evmTx.gasLimit,
+      chainId: evmTx.evmTx.chainId,
+      skipContractAddress,
+      usdcAddress,
+      amountInMicro: amountInMicro.toString(),
+    });
     console.log("Checking USDC balance and allowance...\n");
     const publicClient = createPublicClient({
       chain,
@@ -772,6 +825,12 @@ async function bridge() {
 
     const balanceFormatted = Number(currentBalance) / 1e6;
     console.log(`  USDC Balance: ${balanceFormatted.toFixed(6)} USDC`);
+    cliDebug("On-chain USDC balance", {
+      raw: currentBalance.toString(),
+      formatted: balanceFormatted.toFixed(6),
+      requiredRaw: amountInMicro.toString(),
+      sufficient: currentBalance >= amountInMicro,
+    });
 
     if (currentBalance < amountInMicro) {
       console.error(`\nInsufficient USDC balance!`);
@@ -792,6 +851,13 @@ async function bridge() {
     const allowanceFormatted = Number(currentAllowance) / 1e6;
     console.log(`  USDC Allowance: ${allowanceFormatted.toFixed(6)} USDC (for Skip contract)`);
     console.log("");
+    cliDebug("On-chain USDC allowance", {
+      raw: currentAllowance.toString(),
+      formatted: allowanceFormatted.toFixed(6),
+      spender: skipContractAddress,
+      requiredRaw: amountInMicro.toString(),
+      needsApproval: currentAllowance < amountInMicro,
+    });
 
     const needsApproval = currentAllowance < amountInMicro;
 
@@ -811,6 +877,14 @@ async function bridge() {
       });
 
       try {
+        cliDebug("Sending approval tx via WalletConnect", {
+          from: walletAddress,
+          to: usdcAddress,
+          spender: skipContractAddress,
+          chainId,
+          topic: session.topic,
+        });
+
         const approveTxHash = await signClient.request({
           topic: session.topic,
           chainId,
@@ -827,6 +901,7 @@ async function bridge() {
         });
 
         console.log(`Approval submitted: ${approveTxHash}`);
+        cliDebug("Approval tx hash received", { approveTxHash });
         console.log("Waiting for confirmation (15 seconds)...\n");
         await new Promise((resolve) => setTimeout(resolve, 15000));
       } catch (error: any) {
@@ -853,23 +928,36 @@ async function bridge() {
     console.log("Check your wallet to confirm the bridge transaction.\n");
 
     try {
+      const bridgeTxParams = {
+        from: walletAddress,
+        to: evmTx.evmTx.to,
+        data: evmTx.evmTx.data,
+        value: evmTx.evmTx.value || "0x0",
+      };
+
+      cliDebug("Sending bridge tx via WalletConnect", {
+        chainId,
+        topic: session.topic,
+        params: {
+          from: bridgeTxParams.from,
+          to: bridgeTxParams.to,
+          value: bridgeTxParams.value,
+          dataLength: bridgeTxParams.data?.length,
+          dataPreview: bridgeTxParams.data?.slice(0, 74) + "...",
+        },
+      });
+
       const bridgeTxHash = (await signClient.request({
         topic: session.topic,
         chainId,
         request: {
           method: "eth_sendTransaction",
-          params: [
-            {
-              from: walletAddress,
-              to: evmTx.evmTx.to,
-              data: evmTx.evmTx.data,
-              value: evmTx.evmTx.value || "0x0",
-            },
-          ],
+          params: [bridgeTxParams],
         },
       })) as string;
 
       console.log(`Bridge transaction submitted: ${bridgeTxHash}\n`);
+      cliDebug("Bridge tx hash received from wallet", { bridgeTxHash });
 
       // Register with Skip's Smart Relay for tracking
       console.log("Registering transaction with Skip relay...\n");
@@ -882,13 +970,20 @@ async function bridge() {
       }
 
       // Disconnect wallet
+      cliDebug("Disconnecting WalletConnect session", { topic: session.topic });
       await signClient.disconnect({
         topic: session.topic,
         reason: { code: 6000, message: "Bridge initiated" },
       });
+      cliDebug("WalletConnect disconnected");
 
       // Wait for bridge completion with per-hop progress
       console.log("Waiting for bridge completion...\n");
+      cliDebug("Starting bridge completion polling", {
+        txHash: bridgeTxHash,
+        chainId: SKIP_CHAINS.BASE_MAINNET,
+        chainPath: route.chainPath,
+      });
 
       const status = await waitForSkipBridgeCompletion(
         bridgeTxHash,
@@ -901,6 +996,11 @@ async function bridge() {
       );
 
       console.log(""); // newline after progress block
+      cliDebug("Bridge polling finished", {
+        finalStatus: status.status,
+        transferDetails: status.transferDetails,
+        assetRelease: status.assetRelease,
+      });
 
       if (status.status === "success") {
         console.log(`
