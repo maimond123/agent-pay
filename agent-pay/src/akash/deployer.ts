@@ -14,7 +14,7 @@
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { DeliverTxResponse, assertIsDeliverTxSuccess } from "@cosmjs/stargate";
 import { sha256 } from "@cosmjs/crypto";
-import { toBase64, fromBase64 } from "@cosmjs/encoding";
+import { fromBase64 } from "@cosmjs/encoding";
 import type { ComputeSpecs } from "../types.js";
 import {
   createSigningClient,
@@ -23,6 +23,7 @@ import {
   selectBestBid,
   queryProvider,
   USDC_DENOM,
+  AKT_DENOM,
   type BidInfo,
 } from "./sdk-client.js";
 import { generateSDL, calculateDeposit, sdlToYaml } from "./sdl-generator.js";
@@ -131,7 +132,7 @@ export async function deployToAkash(
   const deposit = calculateDeposit(specs, specs.hours);
   const version = calculateVersion(sdl);
 
-  console.log(`  Deposit: ${(parseInt(deposit.amount) / 1_000_000).toFixed(6)} USDC`);
+  console.log(`  Deposit: ${(parseInt(deposit.amount) / 1_000_000).toFixed(6)} AKT (escrowed, refunded on close)`);
 
   // 3. Get current block height for DSEQ
   const blockHeight = await getCurrentBlockHeight(network);
@@ -142,14 +143,17 @@ export async function deployToAkash(
   // 4. Create deployment transaction
   console.log("[3/5] Creating deployment (signing transaction)...");
 
-  // Build the deployment message
-  // Note: In production, use proper protobuf encoding
+  // Helper to encode a number string as Uint8Array (Akash v1beta4 resource encoding)
+  const encodeResourceVal = (val: string): Uint8Array =>
+    new TextEncoder().encode(val);
+
+  // Build the deployment message (v1beta4 format)
   const createDeploymentMsg = {
-    typeUrl: "/akash.deployment.v1beta3.MsgCreateDeployment",
+    typeUrl: "/akash.deployment.v1beta4.MsgCreateDeployment",
     value: {
       id: {
         owner,
-        dseq,
+        dseq: BigInt(dseq),
       },
       groups: [
         {
@@ -164,25 +168,30 @@ export async function deployToAkash(
           resources: [
             {
               resource: {
-                cpu: { units: { val: `${specs.cpu * 1000}` } },
-                memory: { quantity: { val: parseBytes(specs.memory).toString() } },
-                storage: [{ quantity: { val: parseBytes(specs.storage).toString() } }],
+                id: 1,
+                cpu: { units: { val: encodeResourceVal(`${specs.cpu * 1000}`) }, attributes: [] },
+                memory: { quantity: { val: encodeResourceVal(parseBytes(specs.memory).toString()) }, attributes: [] },
+                gpu: { units: { val: encodeResourceVal(specs.gpu ? `${specs.gpu.count}` : "0") }, attributes: specs.gpu?.model ? [{ key: "vendor/nvidia/model", value: specs.gpu.model }] : [] },
+                storage: [{ name: "default", quantity: { val: encodeResourceVal(parseBytes(specs.storage).toString()) }, attributes: [] }],
+                endpoints: [],
               },
               count: 1,
               price: {
-                denom: USDC_DENOM,
+                denom: AKT_DENOM,
                 amount: calculateHourlyPrice(specs).toString(),
               },
             },
           ],
         },
       ],
-      version: toBase64(version),
+      hash: version,
       deposit: {
-        denom: deposit.denom,
-        amount: deposit.amount,
+        amount: {
+          denom: deposit.denom,
+          amount: deposit.amount,
+        },
+        sources: [1], // Source.balance — fund deposit from account balance
       },
-      depositor: owner,
     },
   };
 
@@ -243,14 +252,15 @@ export async function deployToAkash(
   console.log("[5/5] Creating lease (signing transaction)...");
 
   const createLeaseMsg = {
-    typeUrl: "/akash.market.v1beta4.MsgCreateLease",
+    typeUrl: "/akash.market.v1beta5.MsgCreateLease",
     value: {
       bidId: {
         owner: selectedBid.bidId.owner,
-        dseq: selectedBid.bidId.dseq,
+        dseq: BigInt(selectedBid.bidId.dseq),
         gseq: selectedBid.bidId.gseq,
         oseq: selectedBid.bidId.oseq,
         provider: selectedBid.bidId.provider,
+        bseq: 0,
       },
     },
   };
@@ -351,11 +361,11 @@ export async function closeDeployment(
   const signingClient = await createSigningClient(wallet, network);
 
   const closeMsg = {
-    typeUrl: "/akash.deployment.v1beta3.MsgCloseDeployment",
+    typeUrl: "/akash.deployment.v1beta4.MsgCloseDeployment",
     value: {
       id: {
         owner,
-        dseq,
+        dseq: BigInt(dseq),
       },
     },
   };
@@ -498,15 +508,15 @@ async function getDeploymentEndpoints(
  */
 function parseBytes(size: string): number {
   const units: Record<string, number> = {
-    "B": 1,
-    "KB": 1024,
-    "MB": 1024 * 1024,
-    "GB": 1024 * 1024 * 1024,
-    "TB": 1024 * 1024 * 1024 * 1024,
-    "Ki": 1024,
-    "Mi": 1024 * 1024,
-    "Gi": 1024 * 1024 * 1024,
-    "Ti": 1024 * 1024 * 1024 * 1024,
+    "b": 1,
+    "kb": 1024,
+    "mb": 1024 * 1024,
+    "gb": 1024 * 1024 * 1024,
+    "tb": 1024 * 1024 * 1024 * 1024,
+    "ki": 1024,
+    "mi": 1024 * 1024,
+    "gi": 1024 * 1024 * 1024,
+    "ti": 1024 * 1024 * 1024 * 1024,
   };
 
   const match = size.match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|Ki|Mi|Gi|Ti)?$/i);
@@ -515,8 +525,8 @@ function parseBytes(size: string): number {
   }
 
   const value = parseFloat(match[1]);
-  const unit = match[2]?.toUpperCase() || "B";
-  const multiplier = units[unit] || units[unit.replace(/B$/i, "")] || 1;
+  const unit = (match[2] || "B").toLowerCase();
+  const multiplier = units[unit] || 1;
 
   return Math.floor(value * multiplier);
 }

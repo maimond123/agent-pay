@@ -259,12 +259,11 @@ export function calculateDeposit(
     gpuCost
   );
 
-  // Total with 10% buffer
-  const totalMicro = Math.ceil(hourlyPriceMicro * hours * 1.1);
-
+  // Akash requires deposits in uakt (native AKT), not USDC.
+  // Minimum deposit is 0.5 AKT (500000 uakt) — this is escrowed and refunded on close.
   return {
-    amount: totalMicro.toString(),
-    denom: USDC_DENOM,
+    amount: "500000",
+    denom: "uakt",
   };
 }
 

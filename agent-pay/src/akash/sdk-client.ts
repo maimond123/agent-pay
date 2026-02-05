@@ -5,8 +5,9 @@
  * Handles queries and transaction broadcasting with user wallet signing.
  */
 
-import { StargateClient, SigningStargateClient, GasPrice } from "@cosmjs/stargate";
+import { StargateClient, SigningStargateClient, GasPrice, defaultRegistryTypes } from "@cosmjs/stargate";
 import { DirectSecp256k1HdWallet, Registry } from "@cosmjs/proto-signing";
+import { getAkashTypeRegistry } from "@akashnetwork/akashjs/build/stargate/index.js";
 
 // Network configuration
 export const AKASH_RPC_ENDPOINTS = {
@@ -88,6 +89,23 @@ let queryClient: StargateClient | null = null;
 let queryClientNetwork: string | null = null;
 
 /**
+ * Normalize state from string or number to numeric enum value.
+ * v1beta5 REST API returns string states ("open", "active", "closed")
+ * while older versions return numeric (1, 2, 3).
+ */
+function normalizeState(state: string | number): number {
+  if (typeof state === "number") return state;
+  const stateMap: Record<string, number> = {
+    "invalid": 0,
+    "open": 1,
+    "active": 1,
+    "insufficient_funds": 2,
+    "closed": 2,
+  };
+  return stateMap[state.toLowerCase()] ?? 0;
+}
+
+/**
  * Get or create a query client
  */
 async function getQueryClient(network: "mainnet" | "testnet" = "mainnet"): Promise<StargateClient> {
@@ -122,10 +140,11 @@ export async function createSigningClient(
   const endpoints = AKASH_RPC_ENDPOINTS[network];
   let lastError: Error | null = null;
 
-  // Create registry with Akash message types
-  const registry = new Registry();
-  // Note: In production, you'd register Akash-specific message types here
-  // For now, we'll use the default registry and construct messages manually
+  // Create registry with both default CosmJS types and Akash-specific types
+  const registry = new Registry([
+    ...defaultRegistryTypes,
+    ...getAkashTypeRegistry(),
+  ]);
 
   for (const endpoint of endpoints) {
     try {
@@ -133,6 +152,7 @@ export async function createSigningClient(
         endpoint,
         wallet,
         {
+          registry,
           gasPrice: GasPrice.fromString("0.025uakt"),
         }
       );
@@ -188,7 +208,7 @@ export async function queryDeployments(
 
   for (const endpoint of restEndpoints) {
     try {
-      const url = `${endpoint}/akash/deployment/v1beta3/deployments/list?filters.owner=${owner}`;
+      const url = `${endpoint}/akash/deployment/v1beta4/deployments/list?filters.owner=${owner}`;
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -198,11 +218,11 @@ export async function queryDeployments(
       const data = await response.json();
       return (data.deployments || []).map((d: any) => ({
         deploymentId: {
-          owner: d.deployment.deployment_id.owner,
-          dseq: d.deployment.deployment_id.dseq,
+          owner: (d.deployment.id || d.deployment.deployment_id).owner,
+          dseq: (d.deployment.id || d.deployment.deployment_id).dseq,
         },
-        state: d.deployment.state,
-        version: d.deployment.version,
+        state: normalizeState(d.deployment.state),
+        version: d.deployment.hash || d.deployment.version,
         createdAt: d.deployment.created_at,
       }));
     } catch (error) {
@@ -227,7 +247,7 @@ export async function queryBids(
 
   for (const endpoint of restEndpoints) {
     try {
-      const url = `${endpoint}/akash/market/v1beta4/bids/list?filters.owner=${owner}&filters.dseq=${dseq}`;
+      const url = `${endpoint}/akash/market/v1beta5/bids/list?filters.owner=${owner}&filters.dseq=${dseq}`;
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -235,21 +255,24 @@ export async function queryBids(
       }
 
       const data = await response.json();
-      return (data.bids || []).map((b: any) => ({
-        bidId: {
-          owner: b.bid.bid_id.owner,
-          dseq: b.bid.bid_id.dseq,
-          gseq: parseInt(b.bid.bid_id.gseq),
-          oseq: parseInt(b.bid.bid_id.oseq),
-          provider: b.bid.bid_id.provider,
-        },
-        state: b.bid.state,
-        price: {
-          denom: b.bid.price.denom,
-          amount: b.bid.price.amount,
-        },
-        createdAt: b.bid.created_at,
-      }));
+      return (data.bids || []).map((b: any) => {
+        const bidId = b.bid.id || b.bid.bid_id;
+        return {
+          bidId: {
+            owner: bidId.owner,
+            dseq: bidId.dseq,
+            gseq: parseInt(bidId.gseq),
+            oseq: parseInt(bidId.oseq),
+            provider: bidId.provider,
+          },
+          state: normalizeState(b.bid.state),
+          price: {
+            denom: b.bid.price.denom,
+            amount: b.bid.price.amount,
+          },
+          createdAt: b.bid.created_at,
+        };
+      });
     } catch (error) {
       lastError = error as Error;
       console.warn(`Failed to query bids from ${endpoint}, trying next...`);
@@ -272,7 +295,7 @@ export async function queryLeases(
 
   for (const endpoint of restEndpoints) {
     try {
-      const url = `${endpoint}/akash/market/v1beta4/leases/list?filters.owner=${owner}&filters.dseq=${dseq}`;
+      const url = `${endpoint}/akash/market/v1beta5/leases/list?filters.owner=${owner}&filters.dseq=${dseq}`;
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -280,22 +303,25 @@ export async function queryLeases(
       }
 
       const data = await response.json();
-      return (data.leases || []).map((l: any) => ({
-        leaseId: {
-          owner: l.lease.lease_id.owner,
-          dseq: l.lease.lease_id.dseq,
-          gseq: parseInt(l.lease.lease_id.gseq),
-          oseq: parseInt(l.lease.lease_id.oseq),
-          provider: l.lease.lease_id.provider,
-        },
-        state: l.lease.state,
-        price: {
-          denom: l.lease.price.denom,
-          amount: l.lease.price.amount,
-        },
-        createdAt: l.lease.created_at,
-        closedOn: l.lease.closed_on,
-      }));
+      return (data.leases || []).map((l: any) => {
+        const leaseId = l.lease.id || l.lease.lease_id;
+        return {
+          leaseId: {
+            owner: leaseId.owner,
+            dseq: leaseId.dseq,
+            gseq: parseInt(leaseId.gseq),
+            oseq: parseInt(leaseId.oseq),
+            provider: leaseId.provider,
+          },
+          state: normalizeState(l.lease.state),
+          price: {
+            denom: l.lease.price.denom,
+            amount: l.lease.price.amount,
+          },
+          createdAt: l.lease.created_at,
+          closedOn: l.lease.closed_on,
+        };
+      });
     } catch (error) {
       lastError = error as Error;
       console.warn(`Failed to query leases from ${endpoint}, trying next...`);
@@ -317,7 +343,7 @@ export async function queryProvider(
 
   for (const endpoint of restEndpoints) {
     try {
-      const url = `${endpoint}/akash/provider/v1beta3/providers/${providerAddress}`;
+      const url = `${endpoint}/akash/provider/v1beta4/providers/${providerAddress}`;
       const response = await fetch(url);
 
       if (!response.ok) {
