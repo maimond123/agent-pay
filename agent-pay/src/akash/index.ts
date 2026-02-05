@@ -36,6 +36,13 @@ export {
   type DeploymentInfo,
 } from "./sdk-client.js";
 
+// Certificate - mTLS + JWT authentication with providers
+export {
+  getOrCreateCertificate,
+  generateProviderJwt,
+  mtlsFetch,
+} from "./certificate.js";
+
 // SDL Generator - manifest creation
 export {
   generateSDL,

@@ -12,9 +12,9 @@
  */
 
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
+import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { DeliverTxResponse, assertIsDeliverTxSuccess } from "@cosmjs/stargate";
 import { sha256 } from "@cosmjs/crypto";
-import { fromBase64 } from "@cosmjs/encoding";
 import type { ComputeSpecs } from "../types.js";
 import {
   createSigningClient,
@@ -22,11 +22,11 @@ import {
   queryBids,
   selectBestBid,
   queryProvider,
-  USDC_DENOM,
   AKT_DENOM,
   type BidInfo,
 } from "./sdk-client.js";
 import { generateSDL, calculateDeposit, sdlToYaml } from "./sdl-generator.js";
+import { getOrCreateCertificate, generateProviderJwt, mtlsFetch } from "./certificate.js";
 
 // Deployment state enum (matches Akash chain)
 export enum DeploymentState {
@@ -98,11 +98,13 @@ function calculateVersion(sdl: any): Uint8Array {
  * Deploy to Akash network
  *
  * @param wallet - User's wallet (signs all transactions)
+ * @param aminoWallet - Amino wallet (for JWT signing)
  * @param options - Deployment options
  * @returns Deployment result with endpoints
  */
 export async function deployToAkash(
   wallet: DirectSecp256k1HdWallet,
+  aminoWallet: Secp256k1HdWallet,
   options: DeploymentOptions
 ): Promise<DeploymentResult> {
   const {
@@ -122,12 +124,15 @@ export async function deployToAkash(
   console.log(`  Image: ${specs.image}`);
   console.log(`  CPU: ${specs.cpu}, Memory: ${specs.memory}, Storage: ${specs.storage}`);
 
-  // 1. Create signing client
-  console.log("\n[1/5] Connecting to Akash network...");
+  // 1. Create signing client and ensure certificate exists
+  console.log("\n[1/6] Connecting to Akash network...");
   const signingClient = await createSigningClient(wallet, network);
 
+  console.log("[2/6] Ensuring mTLS certificate...");
+  const cert = await getOrCreateCertificate(wallet, network);
+
   // 2. Generate SDL and calculate deposit
-  console.log("[2/5] Generating deployment manifest...");
+  console.log("[3/6] Generating deployment manifest...");
   const sdl = generateSDL(specs, env, command);
   const deposit = calculateDeposit(specs, specs.hours);
   const version = calculateVersion(sdl);
@@ -141,7 +146,7 @@ export async function deployToAkash(
   console.log(`  DSEQ: ${dseq}`);
 
   // 4. Create deployment transaction
-  console.log("[3/5] Creating deployment (signing transaction)...");
+  console.log("[4/6] Creating deployment (signing transaction)...");
 
   // Helper to encode a number string as Uint8Array (Akash v1beta4 resource encoding)
   const encodeResourceVal = (val: string): Uint8Array =>
@@ -210,7 +215,7 @@ export async function deployToAkash(
   }
 
   // 5. Wait for bids
-  console.log(`[4/5] Waiting for provider bids (${bidWaitSeconds}s)...`);
+  console.log(`[5/6] Waiting for provider bids (${bidWaitSeconds}s)...`);
 
   let selectedBid: BidInfo | null = null;
   const bidStartTime = Date.now();
@@ -249,7 +254,7 @@ export async function deployToAkash(
   }
 
   // 6. Create lease
-  console.log("[5/5] Creating lease (signing transaction)...");
+  console.log("[6/6] Creating lease (signing transaction)...");
 
   const createLeaseMsg = {
     typeUrl: "/akash.market.v1beta5.MsgCreateLease",
@@ -285,7 +290,19 @@ export async function deployToAkash(
   const providerInfo = await queryProvider(selectedBid.bidId.provider, network);
   const providerHost = providerInfo?.provider?.host_uri || "";
 
-  if (providerHost) {
+  // Generate JWT token for provider authentication
+  const jwtToken = await generateProviderJwt(aminoWallet);
+
+  if (!providerHost) {
+    throw new Error("Provider host not found. Cannot send manifest.");
+  }
+
+  // Retry manifest send with delays - provider may need time to sync cert from chain
+  const maxRetries = 5;
+  const retryDelayMs = 3000;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       await sendManifest(
         providerHost,
@@ -294,13 +311,32 @@ export async function deployToAkash(
         selectedBid.bidId.gseq,
         selectedBid.bidId.oseq,
         sdl,
-        wallet
+        cert,
+        jwtToken
       );
       console.log("  Manifest sent successfully");
+      lastError = null;
+      break;
     } catch (error: any) {
-      console.warn(`  Warning: Failed to send manifest: ${error.message}`);
-      console.warn("  You may need to send the manifest manually");
+      lastError = error;
+      if (attempt < maxRetries) {
+        console.log(`  Attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+        console.log(`  Retrying in ${retryDelayMs/1000}s...`);
+        await sleep(retryDelayMs);
+      }
     }
+  }
+
+  if (lastError) {
+    // Close the deployment to refund the deposit since manifest failed
+    console.error(`\n  Failed to send manifest after ${maxRetries} attempts: ${lastError.message}`);
+    console.error("  Closing deployment to refund deposit...");
+    try {
+      await closeDeployment(wallet, dseq, network);
+    } catch (closeError: any) {
+      console.error(`  Warning: Could not close deployment: ${closeError.message}`);
+    }
+    throw new Error(`Manifest rejected by provider: ${lastError.message}`);
   }
 
   // 8. Get deployment endpoints
@@ -309,7 +345,9 @@ export async function deployToAkash(
     owner,
     dseq,
     selectedBid.bidId.gseq,
-    selectedBid.bidId.oseq
+    selectedBid.bidId.oseq,
+    cert,
+    jwtToken
   );
 
   const result: DeploymentResult = {
@@ -386,7 +424,7 @@ export async function closeDeployment(
 }
 
 /**
- * Send manifest to provider
+ * Send manifest to provider with mTLS + JWT authentication
  */
 async function sendManifest(
   providerHost: string,
@@ -395,16 +433,15 @@ async function sendManifest(
   gseq: number,
   oseq: number,
   sdl: any,
-  wallet: DirectSecp256k1HdWallet
+  cert: { cert: string; privateKey: string },
+  jwtToken: string
 ): Promise<void> {
   // The provider expects the manifest in a specific format
   const manifest = sdlToManifest(sdl);
 
   const url = `${providerHost}/deployment/${dseq}/manifest`;
 
-  // Note: Provider may require authentication
-  // In production, sign the request with the wallet
-  const response = await fetch(url, {
+  const response = await mtlsFetch(url, cert as any, jwtToken, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
@@ -420,53 +457,89 @@ async function sendManifest(
 
 /**
  * Convert SDL to manifest format for provider
+ * Manifest structure: array of groups, each containing services
+ *
+ * ResourceValue.val is a plain string number (parsed by Go as *big.Int)
  */
 function sdlToManifest(sdl: any): any {
-  // Convert SDL format to provider manifest format
-  const manifest: any[] = [];
+  // Build services array for the group
+  const services: any[] = [];
 
   for (const [serviceName, service] of Object.entries<any>(sdl.services)) {
     const resources = sdl.profiles.compute[serviceName]?.resources || {};
 
-    manifest.push({
+    // Get CPU value in millicores, strip 'm' suffix if present
+    const cpuMillicores = resources.cpu?.units?.replace(/m$/, "") || "1000";
+
+    // Get memory value in bytes
+    const memoryBytes = resources.memory?.size
+      ? parseStorageSize(resources.memory.size)
+      : "536870912";
+
+    services.push({
       name: serviceName,
       image: service.image,
-      command: service.command,
-      args: service.args,
+      command: service.command || null,
+      args: service.args || null,
       env: service.env?.map((e: string) => {
         const [key, ...valueParts] = e.split("=");
         return { name: key, value: valueParts.join("=") };
-      }),
+      }) || null,
       resources: {
-        cpu: resources.cpu,
-        memory: resources.memory,
-        storage: resources.storage,
-        gpu: resources.gpu,
+        id: 1,
+        cpu: {
+          units: { val: cpuMillicores },
+          attributes: [],
+        },
+        memory: {
+          quantity: { val: memoryBytes },
+          attributes: [],
+        },
+        storage: (resources.storage || [{ size: "1Gi" }]).map((s: any) => ({
+          name: "default",
+          quantity: { val: parseStorageSize(s.size) },
+          attributes: [],
+        })),
+        gpu: {
+          units: { val: resources.gpu?.units || "0" },
+          attributes: resources.gpu?.model
+            ? [{ key: "vendor/nvidia/model", value: resources.gpu.model }]
+            : [],
+        },
+        endpoints: [],
       },
       count: 1,
       expose: service.expose?.map((e: any) => ({
         port: e.port,
         externalPort: e.as || e.port,
-        proto: e.proto || "TCP",
+        proto: (e.proto || "TCP").toUpperCase(),
         service: serviceName,
         global: e.to?.some((t: any) => t.global) || false,
-        hosts: [],
-      })),
+        hosts: null,
+      })) || [],
     });
   }
 
-  return manifest;
+  // Return manifest as array of groups (we use one group named "dcloud")
+  return [
+    {
+      name: "dcloud",
+      services,
+    },
+  ];
 }
 
 /**
- * Get deployment endpoints from provider
+ * Get deployment endpoints from provider (with mTLS + JWT)
  */
 async function getDeploymentEndpoints(
   providerHost: string,
   owner: string,
   dseq: string,
   gseq: number,
-  oseq: number
+  oseq: number,
+  cert: { cert: string; privateKey: string },
+  jwtToken: string
 ): Promise<DeploymentEndpoint[]> {
   if (!providerHost) {
     return [];
@@ -474,7 +547,7 @@ async function getDeploymentEndpoints(
 
   try {
     const url = `${providerHost}/lease/${dseq}/${gseq}/${oseq}/status`;
-    const response = await fetch(url);
+    const response = await mtlsFetch(url, cert as any, jwtToken);
 
     if (!response.ok) {
       return [];
@@ -501,6 +574,13 @@ async function getDeploymentEndpoints(
   } catch {
     return [];
   }
+}
+
+/**
+ * Parse storage size string to bytes string (for manifest)
+ */
+function parseStorageSize(size: string): string {
+  return parseBytes(size).toString();
 }
 
 /**

@@ -17,6 +17,7 @@ import { homedir } from "os";
 import { join } from "path";
 import * as readline from "readline";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
+import { Secp256k1HdWallet } from "@cosmjs/amino";
 
 // Storage directory
 const WALLET_DIR = join(homedir(), ".agent-pay", "wallets");
@@ -26,6 +27,7 @@ const SESSION_DURATION_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 interface WalletSession {
   wallet: DirectSecp256k1HdWallet;
+  aminoWallet: Secp256k1HdWallet;  // For JWT signing
   address: string;
   unlockedAt: number;
   expiresAt: number;
@@ -198,11 +200,12 @@ export function saveWallet(
 
 /**
  * Load and decrypt a wallet from disk
+ * Returns both Direct (for transactions) and Amino (for JWT signing) wallets
  */
 export async function loadWallet(
   address: string,
   password: string
-): Promise<DirectSecp256k1HdWallet> {
+): Promise<{ wallet: DirectSecp256k1HdWallet; aminoWallet: Secp256k1HdWallet }> {
   const filePath = join(WALLET_DIR, `${address}.json`);
 
   if (!existsSync(filePath)) {
@@ -225,22 +228,26 @@ export async function loadWallet(
     throw new Error("Incorrect password");
   }
 
-  // Create wallet from mnemonic
+  // Create both wallet types from mnemonic
   const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, {
+    prefix: "akash",
+  });
+  const aminoWallet = await Secp256k1HdWallet.fromMnemonic(mnemonic, {
     prefix: "akash",
   });
 
   // Mnemonic goes out of scope here - garbage collected
-  return wallet;
+  return { wallet, aminoWallet };
 }
 
 /**
  * Get or unlock a wallet with session support
  * If wallet was recently unlocked, reuse the session
+ * Returns both Direct (for transactions) and Amino (for JWT signing) wallets
  */
 export async function getOrUnlockWallet(
   address: string
-): Promise<DirectSecp256k1HdWallet> {
+): Promise<{ wallet: DirectSecp256k1HdWallet; aminoWallet: Secp256k1HdWallet }> {
   // Check for valid session
   if (
     activeSession &&
@@ -251,25 +258,26 @@ export async function getOrUnlockWallet(
       (activeSession.expiresAt - Date.now()) / 60000
     );
     console.log(`Using unlocked wallet (${remaining} min remaining)`);
-    return activeSession.wallet;
+    return { wallet: activeSession.wallet, aminoWallet: activeSession.aminoWallet };
   }
 
   // Need to unlock
   console.log("🔐 Wallet locked. Enter password to unlock.");
   const password = await promptPassword("Password: ");
 
-  const wallet = await loadWallet(address, password);
+  const { wallet, aminoWallet } = await loadWallet(address, password);
 
   // Create session
   activeSession = {
     wallet,
+    aminoWallet,
     address,
     unlockedAt: Date.now(),
     expiresAt: Date.now() + SESSION_DURATION_MS,
   };
 
-  console.log("✓ Wallet unlocked for 15 minutes");
-  return wallet;
+  console.log("✓ Wallet unlocked for 4 hours");
+  return { wallet, aminoWallet };
 }
 
 /**

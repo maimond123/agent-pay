@@ -467,10 +467,10 @@ async function deploy() {
   console.log(`Wallet: ${address}\n`);
 
   // Unlock wallet
-  const wallet = await getOrUnlockWallet(address);
+  const { wallet, aminoWallet } = await getOrUnlockWallet(address);
 
   try {
-    const result = await deployToAkash(wallet, {
+    const result = await deployToAkash(wallet, aminoWallet, {
       specs,
       env: Object.keys(env).length > 0 ? env : undefined,
       network,
@@ -535,7 +535,7 @@ async function close(dseqArg?: string) {
   console.log(`Network: ${network}\n`);
 
   // Unlock wallet
-  const wallet = await getOrUnlockWallet(address);
+  const { wallet } = await getOrUnlockWallet(address);
 
   try {
     const result = await closeDeployment(wallet, dseqArg, network);
@@ -1024,12 +1024,12 @@ async function bridge() {
 
         // Unlock wallet to derive Noble signing key
         console.log("Unlocking wallet for Noble IBC signing...\n");
-        const akashWallet = await getOrUnlockWallet(akashAddress);
+        const { wallet: akashWallet } = await getOrUnlockWallet(akashAddress);
 
         // Re-derive the wallet with Noble bech32 prefix (same key, different prefix)
         cliDebug("Deriving Noble wallet from Akash wallet mnemonic");
         const nobleWallet = await DirectSecp256k1HdWallet.fromMnemonic(
-          akashWallet.mnemonic,
+          (akashWallet as any).mnemonic,
           { prefix: "noble" }
         );
         const [nobleAccount] = await nobleWallet.getAccounts();
@@ -1297,11 +1297,11 @@ async function bridgeResume() {
 
   // Step 2: Unlock wallet and derive Noble key
   console.log("Unlocking wallet...\n");
-  const akashWallet = await getOrUnlockWallet(akashAddress);
+  const { wallet: akashWallet } = await getOrUnlockWallet(akashAddress);
 
   cliDebug("bridge-resume — deriving Noble wallet");
   const nobleWallet = await DirectSecp256k1HdWallet.fromMnemonic(
-    akashWallet.mnemonic,
+    (akashWallet as any).mnemonic,
     { prefix: "noble" }
   );
   const [nobleAccount] = await nobleWallet.getAccounts();
