@@ -32,8 +32,9 @@ import {
   getDeploymentStatus,
   queryDeployments,
 } from "./akash/index.js";
-import { createSkipBridge, trackSkipTransaction, waitForSkipBridgeCompletion, SKIP_CHAINS } from "./bridge/index.js";
+import { createSkipBridge, trackSkipTransaction, waitForSkipBridgeCompletion, signAndBroadcastCosmosTx, SKIP_CHAINS } from "./bridge/index.js";
 import { fromBech32, toBech32 } from "@cosmjs/encoding";
+import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 
 // Debug logging — set SKIP_DEBUG=1 to enable verbose logging
 const CLI_DEBUG = process.env.SKIP_DEBUG === "1";
@@ -996,13 +997,170 @@ async function bridge() {
       );
 
       console.log(""); // newline after progress block
-      cliDebug("Bridge polling finished", {
+      cliDebug("Phase 1 bridge polling finished", {
         finalStatus: status.status,
         transferDetails: status.transferDetails,
         assetRelease: status.assetRelease,
       });
 
-      if (status.status === "success") {
+      // ================================================================
+      // Phase 2: If there are Cosmos txs (Noble IBC transfer), sign
+      // and broadcast them to forward funds Noble -> Osmosis -> Akash
+      // ================================================================
+      const cosmosTxs = transactions.filter(
+        (tx) => tx.txType === "cosmos" && tx.cosmosTx
+      );
+
+      cliDebug("Phase 2 check — cosmos transactions", {
+        count: cosmosTxs.length,
+        chains: cosmosTxs.map((tx) => tx.chainId),
+        phase1Status: status.status,
+      });
+
+      if (status.status === "success" && cosmosTxs.length > 0) {
+        // Phase 1 (CCTP: Base -> Noble) completed. Now execute Phase 2 (IBC: Noble -> Osmosis -> Akash)
+        console.log("Phase 1 complete (CCTP: Base -> Noble).\n");
+        console.log("Starting Phase 2: IBC transfer (Noble -> Osmosis -> Akash)...\n");
+
+        // Unlock wallet to derive Noble signing key
+        console.log("Unlocking wallet for Noble IBC signing...\n");
+        const akashWallet = await getOrUnlockWallet(akashAddress);
+
+        // Re-derive the wallet with Noble bech32 prefix (same key, different prefix)
+        cliDebug("Deriving Noble wallet from Akash wallet mnemonic");
+        const nobleWallet = await DirectSecp256k1HdWallet.fromMnemonic(
+          akashWallet.mnemonic,
+          { prefix: "noble" }
+        );
+        const [nobleAccount] = await nobleWallet.getAccounts();
+        console.log(`Noble address: ${nobleAccount.address}\n`);
+        cliDebug("Noble wallet derived", { nobleAddress: nobleAccount.address });
+
+        // Sign and broadcast each cosmos tx (typically just one Noble IBC transfer)
+        for (let i = 0; i < cosmosTxs.length; i++) {
+          const cosmosTx = cosmosTxs[i];
+          console.log(
+            `Signing cosmos tx ${i + 1}/${cosmosTxs.length} on ${cosmosTx.chainId}...\n`
+          );
+          cliDebug(`Phase 2 — Signing cosmos tx ${i + 1}/${cosmosTxs.length}`, {
+            chainId: cosmosTx.chainId,
+            msgCount: cosmosTx.cosmosTx?.msgs?.length || 0,
+            rawMsgs: JSON.stringify(cosmosTx.cosmosTx?.msgs || []).slice(0, 500),
+          });
+
+          try {
+            const cosmosResult = await signAndBroadcastCosmosTx(
+              nobleWallet,
+              cosmosTx.cosmosTx!
+            );
+
+            console.log(`\nNoble tx broadcast: ${cosmosResult.txHash}\n`);
+            cliDebug("Phase 2 — Cosmos tx broadcast success", cosmosResult);
+
+            // Register Noble tx with Skip relay for tracking
+            console.log("Registering Noble tx with Skip relay...\n");
+            try {
+              const nobleTrack = await trackSkipTransaction(
+                cosmosResult.txHash,
+                cosmosResult.chainId,
+                { initialDelayMs: 3000, maxRetries: 5 }
+              );
+              console.log(`Explorer: ${nobleTrack.explorerLink}\n`);
+              cliDebug("Phase 2 — Noble tx tracked", nobleTrack);
+            } catch (trackErr: any) {
+              console.warn(
+                `Warning: Could not register Noble tx with Skip relay: ${trackErr.message}`
+              );
+              console.warn("Will still attempt to poll for status...\n");
+              cliDebug("Phase 2 — Noble tx track failed (non-fatal)", {
+                error: trackErr.message,
+              });
+            }
+
+            // Wait for IBC hops to complete (Noble -> Osmosis -> Akash)
+            console.log("Waiting for IBC transfer to complete...\n");
+            cliDebug("Phase 2 — Starting IBC completion polling", {
+              txHash: cosmosResult.txHash,
+              chainId: cosmosResult.chainId,
+            });
+
+            const ibcStatus = await waitForSkipBridgeCompletion(
+              cosmosResult.txHash,
+              cosmosResult.chainId,
+              {
+                timeoutMs: 600000, // 10 min for IBC (much faster than CCTP)
+                pollIntervalMs: 10000, // Poll every 10 seconds
+                chainPath: route.chainPath.filter(
+                  (c) => c !== SKIP_CHAINS.BASE_MAINNET
+                ), // Noble -> Osmosis -> Akash
+              }
+            );
+
+            console.log(""); // newline after progress block
+            cliDebug("Phase 2 — IBC polling finished", {
+              finalStatus: ibcStatus.status,
+              transferDetails: ibcStatus.transferDetails,
+              assetRelease: ibcStatus.assetRelease,
+            });
+
+            if (ibcStatus.status === "success") {
+              console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Bridge Complete!                             ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Sent: ${amount} USDC
+  Received: ~${outputAmount} ${outputToken}
+  To: ${akashAddress}
+
+  Phase 1 TX (CCTP):  ${bridgeTxHash}
+  Phase 2 TX (IBC):   ${cosmosResult.txHash}
+  Fees: ~$${route.fees.totalUsd}
+
+Your Akash wallet is now funded! You can deploy compute:
+  npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04
+`);
+            } else if (ibcStatus.status === "failed") {
+              console.error(`\nIBC transfer (Phase 2) failed.`);
+              console.error(`CCTP TX: ${bridgeTxHash}`);
+              console.error(`Noble TX: ${cosmosResult.txHash}`);
+              console.error(`\nYour funds may be on an intermediate chain.`);
+              printIntermediateAddresses(akashAddress, route.chainPath);
+              process.exit(1);
+            } else if (ibcStatus.status === "abandoned") {
+              console.error(`\nIBC transfer tracking abandoned by Skip relay.`);
+              console.error(`Noble TX: ${cosmosResult.txHash}`);
+              console.error("Your funds may be on an intermediate chain.");
+              printIntermediateAddresses(akashAddress, route.chainPath);
+              process.exit(1);
+            } else {
+              // timeout
+              console.log(`
+IBC transfer still processing. Noble TX: ${cosmosResult.txHash}
+
+Track your transfer:
+  https://ibc.fun/tx/${cosmosResult.txHash}
+`);
+              printIntermediateAddresses(akashAddress, route.chainPath);
+              console.log(`
+Check your Akash wallet balance:
+  npx @agent-pay/mcp wallet balance
+`);
+            }
+          } catch (cosmosErr: any) {
+            console.error(`\nFailed to sign/broadcast Noble IBC tx: ${cosmosErr.message}`);
+            cliDebug("Phase 2 — Cosmos tx failed", {
+              error: cosmosErr.message,
+              stack: cosmosErr.stack?.split("\n").slice(0, 5).join("\n"),
+            });
+            console.error(`\nYour USDC arrived on Noble but was not forwarded via IBC.`);
+            console.error(`You can manually transfer from Noble using your wallet.`);
+            printIntermediateAddresses(akashAddress, route.chainPath);
+            process.exit(1);
+          }
+        }
+      } else if (status.status === "success") {
+        // No cosmos txs — single-phase bridge completed successfully
         console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
 ║                  Bridge Complete!                             ║

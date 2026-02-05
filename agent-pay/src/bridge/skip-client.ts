@@ -8,6 +8,8 @@
  */
 
 import { fromBech32, toBech32 } from "@cosmjs/encoding";
+import { SigningStargateClient, GasPrice } from "@cosmjs/stargate";
+import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 
 // Chain identifiers
 export const CHAINS = {
@@ -108,6 +110,13 @@ async function logResponse(label: string, response: Response): Promise<string> {
   );
   return bodyText;
 }
+
+// Noble RPC endpoints for signing IBC transfers (phase 2 of bridge)
+const NOBLE_RPC_ENDPOINTS = [
+  "https://noble-rpc.polkachu.com:443",
+  "https://rpc.noble.strange.love:443",
+  "https://noble-rpc.lavenderfive.com:443",
+];
 
 // Map chain IDs to their bech32 address prefixes
 const CHAIN_PREFIXES: Record<string, string> = {
@@ -828,4 +837,226 @@ function drawProgress(
   process.stdout.write(output);
 
   return lines.length;
+}
+
+// ============================================================================
+// PHASE 2: Noble IBC Transfer Signing
+// ============================================================================
+
+/**
+ * Parse Skip API cosmos messages into CosmJS EncodeObject format.
+ * Skip wraps messages in a `multi_chain_msg` envelope where the `msg`
+ * field is a JSON string of the actual protobuf message.
+ */
+function parseSkipCosmosMsgs(rawMsgs: any[]): Array<{ typeUrl: string; value: any }> {
+  const result: Array<{ typeUrl: string; value: any }> = [];
+
+  for (const rawMsg of rawMsgs) {
+    // Skip uses `multi_chain_msg` wrapper for PFM (multi-hop IBC) messages
+    const wrapper = rawMsg.multi_chain_msg || rawMsg;
+    const msgTypeUrl = wrapper.msg_type_url;
+
+    // Parse the msg JSON string (Skip returns it as a JSON-encoded string)
+    let msgBody: any;
+    if (typeof wrapper.msg === "string") {
+      try {
+        msgBody = JSON.parse(wrapper.msg);
+      } catch (e) {
+        debugLog("parseSkipCosmosMsgs — Failed to parse msg JSON", {
+          msg: wrapper.msg?.slice(0, 200),
+          error: (e as Error).message,
+        });
+        continue;
+      }
+    } else {
+      msgBody = wrapper.msg;
+    }
+
+    // Get type URL from wrapper or from @type field in the msg body
+    const typeUrl = msgTypeUrl || msgBody?.["@type"];
+    if (!typeUrl) {
+      debugLog("parseSkipCosmosMsgs — Skipping msg with no type URL", rawMsg);
+      continue;
+    }
+
+    if (typeUrl === "/ibc.applications.transfer.v1.MsgTransfer") {
+      // Adjust timeout: Skip's original timeout was set relative to route creation time.
+      // Since the CCTP phase takes 15-20 min, the original timeout may have expired.
+      // Set timeout to 30 min from now if the original has expired.
+      const nowNs = BigInt(Date.now()) * BigInt(1_000_000);
+      const thirtyMinFromNowNs = BigInt(Date.now() + 30 * 60 * 1000) * BigInt(1_000_000);
+      const originalTimeoutNs = BigInt(msgBody.timeout_timestamp || "0");
+      const useTimeout = originalTimeoutNs > nowNs ? originalTimeoutNs : thirtyMinFromNowNs;
+
+      debugLog("parseSkipCosmosMsgs — MsgTransfer", {
+        sourcePort: msgBody.source_port,
+        sourceChannel: msgBody.source_channel,
+        token: msgBody.token,
+        sender: msgBody.sender,
+        receiver: msgBody.receiver,
+        originalTimeoutNs: originalTimeoutNs.toString(),
+        nowNs: nowNs.toString(),
+        timeoutExpired: originalTimeoutNs <= nowNs,
+        finalTimeoutNs: useTimeout.toString(),
+        memo: msgBody.memo
+          ? msgBody.memo.slice(0, 200) + (msgBody.memo.length > 200 ? "..." : "")
+          : "(none)",
+      });
+
+      result.push({
+        typeUrl,
+        value: {
+          sourcePort: msgBody.source_port || "transfer",
+          sourceChannel: msgBody.source_channel,
+          token: msgBody.token,
+          sender: msgBody.sender,
+          receiver: msgBody.receiver,
+          timeoutHeight: msgBody.timeout_height
+            ? {
+                revisionNumber: BigInt(msgBody.timeout_height.revision_number || "0"),
+                revisionHeight: BigInt(msgBody.timeout_height.revision_height || "0"),
+              }
+            : { revisionNumber: BigInt(0), revisionHeight: BigInt(0) },
+          timeoutTimestamp: useTimeout,
+          memo: msgBody.memo || "",
+        },
+      });
+    } else {
+      debugLog("parseSkipCosmosMsgs — Unknown type URL, passing raw", { typeUrl });
+      // For unknown types, pass through as-is (likely won't encode correctly,
+      // but at least we'll get a meaningful error)
+      result.push({ typeUrl, value: msgBody });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Sign and broadcast a Cosmos transaction (typically the Noble IBC transfer
+ * that forwards USDC from Noble -> Osmosis -> Akash via PFM).
+ *
+ * This is phase 2 of the two-phase bridge:
+ *   Phase 1: EVM tx on Base (CCTP burn) -> tracked via Skip relay
+ *   Phase 2: Cosmos tx on Noble (IBC transfer with PFM) -> this function
+ *
+ * @param wallet - Noble-prefixed DirectSecp256k1HdWallet (same key as Akash wallet)
+ * @param cosmosTx - The cosmos tx from Skip's msgs_direct response
+ * @returns The tx hash and chain ID
+ */
+export async function signAndBroadcastCosmosTx(
+  wallet: DirectSecp256k1HdWallet,
+  cosmosTx: NonNullable<SkipTransaction["cosmosTx"]>,
+): Promise<{ txHash: string; chainId: string }> {
+  const chainId = cosmosTx.chainId;
+
+  debugLog("signAndBroadcastCosmosTx — Start", {
+    chainId,
+    rawMsgCount: cosmosTx.msgs?.length || 0,
+    rawMsgTypes: (cosmosTx.msgs || []).map((m: any) => {
+      const wrapper = m.multi_chain_msg || m;
+      return wrapper.msg_type_url || "(unknown)";
+    }),
+  });
+
+  // Parse messages from Skip format to CosmJS EncodeObject format
+  const messages = parseSkipCosmosMsgs(cosmosTx.msgs || []);
+  if (messages.length === 0) {
+    throw new Error(
+      `No valid messages found in cosmos tx for chain ${chainId}. ` +
+      `Raw msgs: ${JSON.stringify(cosmosTx.msgs).slice(0, 500)}`
+    );
+  }
+
+  debugLog("signAndBroadcastCosmosTx — Parsed messages", {
+    count: messages.length,
+    typeUrls: messages.map((m) => m.typeUrl),
+  });
+
+  // Get signer address
+  const [account] = await wallet.getAccounts();
+  const signerAddress = account.address;
+  debugLog("signAndBroadcastCosmosTx — Signer", {
+    address: signerAddress,
+    prefix: signerAddress.split("1")[0],
+  });
+
+  // Determine RPC endpoints and gas price based on chain
+  let rpcEndpoints: string[];
+  let gasPrice: GasPrice;
+
+  if (chainId === "noble-1") {
+    rpcEndpoints = NOBLE_RPC_ENDPOINTS;
+    gasPrice = GasPrice.fromString("0.01uusdc");
+  } else {
+    throw new Error(
+      `Unsupported cosmos chain for signing: ${chainId}. ` +
+      `Only noble-1 is currently supported for phase 2 signing.`
+    );
+  }
+
+  // Try each RPC endpoint until one succeeds
+  let lastError: Error | null = null;
+
+  for (const rpc of rpcEndpoints) {
+    try {
+      debugLog("signAndBroadcastCosmosTx — Connecting to RPC", {
+        rpc,
+        chainId,
+        gasPrice: gasPrice.toString(),
+      });
+
+      const client = await SigningStargateClient.connectWithSigner(rpc, wallet, {
+        gasPrice,
+      });
+
+      debugLog("signAndBroadcastCosmosTx — Connected, signing tx", {
+        rpc,
+        signerAddress,
+        msgCount: messages.length,
+        typeUrls: messages.map((m) => m.typeUrl),
+      });
+
+      // Sign and broadcast with auto gas estimation (1.5x multiplier for safety)
+      const result = await client.signAndBroadcast(
+        signerAddress,
+        messages,
+        "auto",
+        `agent-pay bridge phase 2: IBC forward via PFM`,
+      );
+
+      debugLog("signAndBroadcastCosmosTx — Broadcast result", {
+        txHash: result.transactionHash,
+        code: result.code,
+        gasUsed: result.gasUsed?.toString(),
+        gasWanted: result.gasWanted?.toString(),
+        rawLog: result.rawLog?.slice(0, 500),
+      });
+
+      if (result.code !== 0) {
+        throw new Error(
+          `Noble tx failed with code ${result.code}: ${result.rawLog || "(no log)"}`
+        );
+      }
+
+      console.log(`Noble IBC tx broadcast: ${result.transactionHash}`);
+      console.log(`  Gas used: ${result.gasUsed}/${result.gasWanted}`);
+
+      client.disconnect();
+
+      return { txHash: result.transactionHash, chainId };
+    } catch (err: any) {
+      lastError = err;
+      debugLog("signAndBroadcastCosmosTx — RPC endpoint failed", {
+        rpc,
+        error: err.message,
+        stack: err.stack?.split("\n").slice(0, 3).join("\n"),
+      });
+      console.warn(`  Noble RPC ${rpc} failed: ${err.message}`);
+    }
+  }
+
+  throw new Error(
+    `All Noble RPC endpoints failed. Last error: ${lastError?.message || "unknown"}`
+  );
 }

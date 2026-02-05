@@ -14,6 +14,7 @@ export {
   getSkipTransactionStatus,
   trackSkipTransaction,
   waitForSkipBridgeCompletion,
+  signAndBroadcastCosmosTx,
   CHAINS as SKIP_CHAINS,
   TOKENS as SKIP_TOKENS,
   type SkipBridgeParams,
