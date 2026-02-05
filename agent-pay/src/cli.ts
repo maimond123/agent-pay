@@ -32,7 +32,7 @@ import {
   getDeploymentStatus,
   queryDeployments,
 } from "./akash/index.js";
-import { createSkipBridge, trackSkipTransaction, waitForSkipBridgeCompletion, signAndBroadcastCosmosTx, SKIP_CHAINS } from "./bridge/index.js";
+import { createSkipBridge, getSkipTransactions, createSkipRoute, trackSkipTransaction, waitForSkipBridgeCompletion, signAndBroadcastCosmosTx, SKIP_CHAINS } from "./bridge/index.js";
 import { fromBech32, toBech32 } from "@cosmjs/encoding";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 
@@ -1230,6 +1230,161 @@ Check your Akash wallet balance:
 }
 
 // ============================================================================
+// BRIDGE RESUME COMMAND (Phase 2 only — recover funds stuck on Noble)
+// ============================================================================
+
+async function bridgeResume() {
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║       Bridge Resume — Phase 2 (Noble IBC Transfer)           ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  const args = process.argv.slice(3);
+  const getArg = (name: string): string | undefined => {
+    const index = args.indexOf(`--${name}`);
+    return index !== -1 ? args[index + 1] : undefined;
+  };
+
+  const amount = getArg("amount") || "0.28";
+  const destinationType = (getArg("receive") || "akt") as "akt" | "usdc";
+  // A dummy EVM address — we only need the route for cosmos tx data
+  const evmAddress = getArg("evm-address") || "0x0000000000000000000000000000000000000001";
+
+  // Get Akash address
+  const akashAddress = getDefaultWalletAddress();
+  if (!akashAddress) {
+    console.error("No Akash wallet found. Create one first:");
+    console.error("  npx @agent-pay/mcp wallet create");
+    process.exit(1);
+  }
+
+  console.log(`Akash address: ${akashAddress}`);
+  console.log(`Amount on Noble: ${amount} USDC`);
+  console.log(`Destination: ${destinationType.toUpperCase()} on Akash`);
+  console.log("");
+
+  // Step 1: Re-fetch the route from Skip to get the cosmos tx messages
+  console.log("Fetching route from Skip to get IBC transfer data...\n");
+  const bridgeResult = await createSkipBridge({
+    fromAddress: evmAddress,
+    toAddress: akashAddress,
+    amountUSDC: amount,
+    destinationType,
+    slippagePercent: "3",
+  });
+
+  const { route, transactions } = bridgeResult;
+  const cosmosTxs = transactions.filter(
+    (tx) => tx.txType === "cosmos" && tx.cosmosTx
+  );
+
+  cliDebug("bridge-resume — route fetched", {
+    chainPath: route.chainPath,
+    totalTxs: transactions.length,
+    cosmosTxs: cosmosTxs.length,
+    cosmosTxChains: cosmosTxs.map((tx) => tx.chainId),
+  });
+
+  if (cosmosTxs.length === 0) {
+    console.error("No cosmos transactions found in the route.");
+    console.error("This route may not require a Phase 2 Noble IBC transfer.");
+    process.exit(1);
+  }
+
+  console.log(`Route: ${route.chainPath.join(" → ")}`);
+  console.log(`Found ${cosmosTxs.length} cosmos tx(s) to sign.\n`);
+
+  // Step 2: Unlock wallet and derive Noble key
+  console.log("Unlocking wallet...\n");
+  const akashWallet = await getOrUnlockWallet(akashAddress);
+
+  cliDebug("bridge-resume — deriving Noble wallet");
+  const nobleWallet = await DirectSecp256k1HdWallet.fromMnemonic(
+    akashWallet.mnemonic,
+    { prefix: "noble" }
+  );
+  const [nobleAccount] = await nobleWallet.getAccounts();
+  console.log(`Noble address: ${nobleAccount.address}\n`);
+
+  // Step 3: Sign and broadcast each cosmos tx
+  for (let i = 0; i < cosmosTxs.length; i++) {
+    const cosmosTx = cosmosTxs[i];
+    console.log(
+      `Signing cosmos tx ${i + 1}/${cosmosTxs.length} on ${cosmosTx.chainId}...\n`
+    );
+    cliDebug(`bridge-resume — signing tx ${i + 1}`, {
+      chainId: cosmosTx.chainId,
+      msgCount: cosmosTx.cosmosTx?.msgs?.length || 0,
+    });
+
+    try {
+      const cosmosResult = await signAndBroadcastCosmosTx(
+        nobleWallet,
+        cosmosTx.cosmosTx!
+      );
+
+      console.log(`\nNoble tx broadcast: ${cosmosResult.txHash}\n`);
+
+      // Track with Skip relay
+      console.log("Registering with Skip relay...\n");
+      try {
+        const trackResult = await trackSkipTransaction(
+          cosmosResult.txHash,
+          cosmosResult.chainId,
+          { initialDelayMs: 3000, maxRetries: 5 }
+        );
+        console.log(`Explorer: ${trackResult.explorerLink}\n`);
+      } catch (trackErr: any) {
+        console.warn(`Warning: Could not track with Skip: ${trackErr.message}\n`);
+      }
+
+      // Wait for IBC completion
+      console.log("Waiting for IBC transfer to complete...\n");
+      const ibcStatus = await waitForSkipBridgeCompletion(
+        cosmosResult.txHash,
+        cosmosResult.chainId,
+        {
+          timeoutMs: 600000,
+          pollIntervalMs: 10000,
+          chainPath: route.chainPath.filter(
+            (c) => c !== SKIP_CHAINS.BASE_MAINNET
+          ),
+        }
+      );
+
+      console.log("");
+
+      if (ibcStatus.status === "success") {
+        console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║               Phase 2 Bridge Complete!                       ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Noble TX: ${cosmosResult.txHash}
+  To: ${akashAddress}
+
+Your Akash wallet should now have the funds.
+  npx @agent-pay/mcp wallet balance
+`);
+      } else {
+        console.log(`IBC status: ${ibcStatus.status}`);
+        console.log(`Noble TX: ${cosmosResult.txHash}`);
+        printIntermediateAddresses(akashAddress, route.chainPath);
+      }
+    } catch (err: any) {
+      console.error(`\nFailed: ${err.message}`);
+      cliDebug("bridge-resume — error", {
+        error: err.message,
+        stack: err.stack?.split("\n").slice(0, 5).join("\n"),
+      });
+      printIntermediateAddresses(akashAddress, route.chainPath);
+      process.exit(1);
+    }
+  }
+}
+
+// ============================================================================
 // HELP COMMAND
 // ============================================================================
 
@@ -1320,6 +1475,11 @@ if (command === "wallet") {
 } else if (command === "bridge") {
   bridge().catch((error) => {
     console.error("Bridge failed:", error);
+    process.exit(1);
+  });
+} else if (command === "bridge-resume") {
+  bridgeResume().catch((error) => {
+    console.error("Bridge resume failed:", error);
     process.exit(1);
   });
 } else if (command === "--help" || command === "-h" || !command) {

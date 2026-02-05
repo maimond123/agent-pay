@@ -114,8 +114,8 @@ async function logResponse(label: string, response: Response): Promise<string> {
 // Noble RPC endpoints for signing IBC transfers (phase 2 of bridge)
 const NOBLE_RPC_ENDPOINTS = [
   "https://noble-rpc.polkachu.com:443",
-  "https://rpc.noble.strange.love:443",
-  "https://noble-rpc.lavenderfive.com:443",
+  "https://rpc-noble.cosmos-spaces.cloud:443",
+  "https://noble-rpc.owlstake.com:443",
 ];
 
 // Map chain IDs to their bech32 address prefixes
@@ -987,7 +987,7 @@ export async function signAndBroadcastCosmosTx(
 
   if (chainId === "noble-1") {
     rpcEndpoints = NOBLE_RPC_ENDPOINTS;
-    gasPrice = GasPrice.fromString("0.01uusdc");
+    gasPrice = GasPrice.fromString("0.2uusdc");
   } else {
     throw new Error(
       `Unsupported cosmos chain for signing: ${chainId}. ` +

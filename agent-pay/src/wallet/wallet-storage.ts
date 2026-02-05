@@ -22,7 +22,7 @@ import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 const WALLET_DIR = join(homedir(), ".agent-pay", "wallets");
 
 // Session management for unlocked wallets
-const SESSION_DURATION_MS = 15 * 60 * 1000; // 15 minutes
+const SESSION_DURATION_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 interface WalletSession {
   wallet: DirectSecp256k1HdWallet;
