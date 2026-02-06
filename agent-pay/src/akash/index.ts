@@ -46,6 +46,7 @@ export {
   deleteStoredCert,
   generateProviderJwt,
   mtlsFetch,
+  jwtFetch,
   type StoredCert,
 } from "./certificate.js";
 

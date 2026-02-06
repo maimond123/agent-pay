@@ -190,16 +190,57 @@ export function deleteStoredCert(akashAddress: string): void {
   }
 }
 
+type FetchResponse = {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  text: () => Promise<string>;
+  json: () => Promise<any>;
+};
+
+type FetchOptions = {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+};
+
+/**
+ * HTTPS fetch with mTLS client cert + JWT bearer token.
+ * Use for flows where the caller owns the cert private key.
+ */
 export async function mtlsFetch(
   url: string,
   cert: StoredCert,
   jwtToken: string,
-  options: {
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-  } = {}
-): Promise<{ ok: boolean; status: number; statusText: string; text: () => Promise<string>; json: () => Promise<any> }> {
+  options: FetchOptions = {}
+): Promise<FetchResponse> {
+  return _providerFetch(url, options, {
+    cert: cert.cert,
+    key: cert.privateKey,
+    authorization: `Bearer ${jwtToken}`,
+  });
+}
+
+/**
+ * HTTPS fetch with JWT-only auth (no mTLS client cert).
+ * Use for trustless agent-to-agent flows where Agent B holds the cert
+ * but Agent A authenticates via JWT signed by their wallet key.
+ */
+export async function jwtFetch(
+  url: string,
+  jwtToken: string,
+  options: FetchOptions = {}
+): Promise<FetchResponse> {
+  return _providerFetch(url, options, {
+    authorization: `Bearer ${jwtToken}`,
+  });
+}
+
+function _providerFetch(
+  url: string,
+  options: FetchOptions,
+  auth: { cert?: string; key?: string; authorization?: string }
+): Promise<FetchResponse> {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
 
@@ -210,10 +251,10 @@ export async function mtlsFetch(
       method: options.method || "GET",
       headers: {
         ...options.headers,
-        "Authorization": `Bearer ${jwtToken}`,
+        ...(auth.authorization ? { "Authorization": auth.authorization } : {}),
       },
-      cert: cert.cert,
-      key: cert.privateKey,
+      ...(auth.cert ? { cert: auth.cert } : {}),
+      ...(auth.key ? { key: auth.key } : {}),
       rejectUnauthorized: false, // Provider certs are self-signed
     };
 

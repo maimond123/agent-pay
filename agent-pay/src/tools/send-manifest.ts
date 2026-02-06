@@ -1,8 +1,11 @@
 /**
  * Send Manifest Tool
  *
- * Sends the deployment manifest to the provider with mTLS + JWT authentication.
+ * Sends the deployment manifest to the provider with JWT-only authentication.
  * This is the final step in the deployment flow — after this, the container starts running.
+ *
+ * Uses JWT auth (no mTLS client cert) to avoid "ambiguous authentication" errors
+ * from providers that reject dual mTLS + JWT.
  */
 
 import { z } from "zod";
@@ -12,7 +15,7 @@ import {
   generateSDLYaml,
   queryProvider,
   loadStoredCert,
-  mtlsFetch,
+  jwtFetch,
   assembleJwt,
 } from "../akash/index.js";
 import { compressedPubkeyFromHex } from "../wallet/index.js";
@@ -28,9 +31,9 @@ export function registerSendManifest(server: McpServer) {
     {
       title: "Send Deployment Manifest to Provider",
       description:
-        "Sends the deployment manifest to the Akash provider with mTLS + JWT authentication. " +
+        "Sends the deployment manifest to the Akash provider with JWT authentication. " +
         "This is the final step — after success, the container starts running. " +
-        "Requires a stored certificate (from prepare_certificate_tx) and a JWT signature (from prepare_jwt_sign_doc).",
+        "Requires a registered certificate on-chain (from prepare_certificate_tx) and a JWT signature (from prepare_jwt_sign_doc).",
       inputSchema: {
         akashAddress: z
           .string()
@@ -110,7 +113,7 @@ export function registerSendManifest(server: McpServer) {
           pubkey
         );
 
-        // 2. Load stored certificate
+        // 2. Verify certificate exists (needed on-chain, not for HTTP auth)
         const cert = loadStoredCert(args.akashAddress);
         if (!cert) {
           return {
@@ -120,7 +123,7 @@ export function registerSendManifest(server: McpServer) {
                 text:
                   "## Certificate Not Found\n\n" +
                   `No stored certificate for \`${args.akashAddress}\`.\n\n` +
-                  "Run `prepare_certificate_tx` first to create and register a certificate.",
+                  "Run `prepare_certificate_tx` first to create and register a certificate on-chain.",
               },
             ],
             isError: true,
@@ -175,7 +178,7 @@ export function registerSendManifest(server: McpServer) {
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
           try {
-            const response = await mtlsFetch(manifestUrl, cert, jwtToken, {
+            const response = await jwtFetch(manifestUrl, jwtToken, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
               body: manifestJson,
@@ -233,7 +236,7 @@ export function registerSendManifest(server: McpServer) {
 
         try {
           const statusUrl = `${providerHost}/lease/${args.dseq}/${gseq}/${oseq}/status`;
-          const statusResponse = await mtlsFetch(statusUrl, cert, jwtToken);
+          const statusResponse = await jwtFetch(statusUrl, jwtToken);
 
           if (statusResponse.ok) {
             const status = await statusResponse.json();

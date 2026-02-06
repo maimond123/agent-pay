@@ -25,7 +25,7 @@ import {
   type BidInfo,
 } from "./sdk-client.js";
 import { calculateDeposit } from "./sdl-generator.js";
-import { getOrCreateCertificate, generateProviderJwt, mtlsFetch } from "./certificate.js";
+import { getOrCreateCertificate, generateProviderJwt, jwtFetch } from "./certificate.js";
 
 // Deployment state enum (matches Akash chain)
 export enum DeploymentState {
@@ -500,7 +500,7 @@ async function sendManifest(
   // Use the pre-sorted JSON string directly to preserve key ordering
   const manifestJson = sdl.manifestSortedJSON();
 
-  const response = await mtlsFetch(url, cert as any, jwtToken, {
+  const response = await jwtFetch(url, jwtToken, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
@@ -515,7 +515,7 @@ async function sendManifest(
 }
 
 /**
- * Get deployment endpoints from provider (with mTLS + JWT)
+ * Get deployment endpoints from provider (with JWT auth)
  */
 async function getDeploymentEndpoints(
   providerHost: string,
@@ -532,7 +532,7 @@ async function getDeploymentEndpoints(
 
   try {
     const url = `${providerHost}/lease/${dseq}/${gseq}/${oseq}/status`;
-    const response = await mtlsFetch(url, cert as any, jwtToken);
+    const response = await jwtFetch(url, jwtToken);
 
     if (!response.ok) {
       return [];
