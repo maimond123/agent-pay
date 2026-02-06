@@ -14,7 +14,7 @@
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
 import { DeliverTxResponse, assertIsDeliverTxSuccess } from "@cosmjs/stargate";
-import { sha256 } from "@cosmjs/crypto";
+import { SDL } from "@akashnetwork/chain-sdk";
 import type { ComputeSpecs } from "../types.js";
 import {
   createSigningClient,
@@ -22,10 +22,9 @@ import {
   queryBids,
   selectBestBid,
   queryProvider,
-  AKT_DENOM,
   type BidInfo,
 } from "./sdk-client.js";
-import { generateSDL, calculateDeposit, sdlToYaml } from "./sdl-generator.js";
+import { calculateDeposit } from "./sdl-generator.js";
 import { getOrCreateCertificate, generateProviderJwt, mtlsFetch } from "./certificate.js";
 
 // Deployment state enum (matches Akash chain)
@@ -87,11 +86,89 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Calculate SDL version hash
+ * Generate SDL YAML string from compute specs
+ * This format is understood by the chain-sdk SDL parser
  */
-function calculateVersion(sdl: any): Uint8Array {
-  const sdlJson = JSON.stringify(sdl);
-  return sha256(new TextEncoder().encode(sdlJson));
+function generateSDLYaml(
+  specs: ComputeSpecs,
+  env?: Record<string, string>,
+  command?: string[]
+): string {
+  const serviceName = "main";
+
+  // Build expose section
+  const exposeEntries: string[] = [];
+  const ports = specs.ports || [{ port: 80, expose: true }];
+
+  for (const p of ports) {
+    if (p.expose !== false) {
+      const proto = (p as any).protocol || "tcp";
+      exposeEntries.push(`      - port: ${p.port}
+        as: ${p.port}
+        to:
+          - global: true
+        proto: ${proto}`);
+    }
+  }
+
+  // Build env section
+  let envSection = "";
+  if (env && Object.keys(env).length > 0) {
+    const envLines = Object.entries(env).map(([k, v]) => `      - ${k}=${v}`).join("\n");
+    envSection = `
+    env:
+${envLines}`;
+  }
+
+  // Build command section
+  let commandSection = "";
+  if (command && command.length > 0) {
+    const cmdLines = command.map(c => `      - "${c}"`).join("\n");
+    commandSection = `
+    command:
+${cmdLines}`;
+  }
+
+  // Build GPU section
+  let gpuSection = "";
+  if (specs.gpu && specs.gpu.count > 0) {
+    gpuSection = `
+        gpu:
+          units: ${specs.gpu.count}
+          attributes:
+            vendor:
+              nvidia:
+                - model: ${specs.gpu.model || "*"}`;
+  }
+
+  return `version: "2.0"
+services:
+  ${serviceName}:
+    image: ${specs.image}${envSection}${commandSection}
+    expose:
+${exposeEntries.join("\n")}
+profiles:
+  compute:
+    ${serviceName}:
+      resources:
+        cpu:
+          units: ${specs.cpu}
+        memory:
+          size: ${specs.memory}
+        storage:
+          - size: ${specs.storage}${gpuSection}
+  placement:
+    dcloud:
+      pricing:
+        ${serviceName}:
+          denom: uakt
+          amount: 10000
+deployment:
+  ${serviceName}:
+    dcloud:
+      profile: ${serviceName}
+      count: 1
+`;
 }
 
 /**
@@ -131,11 +208,12 @@ export async function deployToAkash(
   console.log("[2/6] Ensuring mTLS certificate...");
   const cert = await getOrCreateCertificate(wallet, network);
 
-  // 2. Generate SDL and calculate deposit
+  // 2. Generate SDL using chain-sdk for proper manifest/version computation
   console.log("[3/6] Generating deployment manifest...");
-  const sdl = generateSDL(specs, env, command);
+  const sdlYaml = generateSDLYaml(specs, env, command);
+  const sdl = SDL.fromString(sdlYaml, "beta3");
   const deposit = calculateDeposit(specs, specs.hours);
-  const version = calculateVersion(sdl);
+  const version = await sdl.manifestVersion();
 
   console.log(`  Deposit: ${(parseInt(deposit.amount) / 1_000_000).toFixed(6)} AKT (escrowed, refunded on close)`);
 
@@ -148,11 +226,10 @@ export async function deployToAkash(
   // 4. Create deployment transaction
   console.log("[4/6] Creating deployment (signing transaction)...");
 
-  // Helper to encode a number string as Uint8Array (Akash v1beta4 resource encoding)
-  const encodeResourceVal = (val: string): Uint8Array =>
-    new TextEncoder().encode(val);
+  // Use chain-sdk groups - these include correct endpoints and resource encoding
+  // that match the manifest, ensuring cross-validation passes
+  const sdlGroups = sdl.groups();
 
-  // Build the deployment message (v1beta4 format)
   const createDeploymentMsg = {
     typeUrl: "/akash.deployment.v1beta4.MsgCreateDeployment",
     value: {
@@ -160,35 +237,7 @@ export async function deployToAkash(
         owner,
         dseq: BigInt(dseq),
       },
-      groups: [
-        {
-          name: "dcloud",
-          requirements: {
-            signedBy: {
-              allOf: [],
-              anyOf: ["akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63"],
-            },
-            attributes: [],
-          },
-          resources: [
-            {
-              resource: {
-                id: 1,
-                cpu: { units: { val: encodeResourceVal(`${specs.cpu * 1000}`) }, attributes: [] },
-                memory: { quantity: { val: encodeResourceVal(parseBytes(specs.memory).toString()) }, attributes: [] },
-                gpu: { units: { val: encodeResourceVal(specs.gpu ? `${specs.gpu.count}` : "0") }, attributes: specs.gpu?.model ? [{ key: "vendor/nvidia/model", value: specs.gpu.model }] : [] },
-                storage: [{ name: "default", quantity: { val: encodeResourceVal(parseBytes(specs.storage).toString()) }, attributes: [] }],
-                endpoints: [],
-              },
-              count: 1,
-              price: {
-                denom: AKT_DENOM,
-                amount: calculateHourlyPrice(specs).toString(),
-              },
-            },
-          ],
-        },
-      ],
+      groups: sdlGroups,
       hash: version,
       deposit: {
         amount: {
@@ -425,6 +474,12 @@ export async function closeDeployment(
 
 /**
  * Send manifest to provider with mTLS + JWT authentication
+ *
+ * Uses the chain-sdk's manifestSorted() method which produces the exact format
+ * that matches the version hash stored on-chain:
+ * - String values for ResourceValue.val fields
+ * - "size" key for memory/storage (not "quantity")
+ * - Canonically sorted keys
  */
 async function sendManifest(
   providerHost: string,
@@ -432,101 +487,31 @@ async function sendManifest(
   dseq: string,
   gseq: number,
   oseq: number,
-  sdl: any,
+  sdl: SDL,
   cert: { cert: string; privateKey: string },
   jwtToken: string
 ): Promise<void> {
-  // The provider expects the manifest in a specific format
-  const manifest = sdlToManifest(sdl);
+  // Get manifest from chain-sdk using manifestSorted() - this produces the exact format
+  // that was used to compute the version hash (string values, "size" key, sorted)
+  const manifest = sdl.manifestSorted();
 
   const url = `${providerHost}/deployment/${dseq}/manifest`;
+
+  // Use the pre-sorted JSON string directly to preserve key ordering
+  const manifestJson = sdl.manifestSortedJSON();
 
   const response = await mtlsFetch(url, cert as any, jwtToken, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(manifest),
+    body: manifestJson,
   });
 
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Provider rejected manifest: ${response.status} - ${errorText}`);
   }
-}
-
-/**
- * Convert SDL to manifest format for provider
- * Manifest structure: array of groups, each containing services
- *
- * ResourceValue.val is a plain string number (parsed by Go as *big.Int)
- */
-function sdlToManifest(sdl: any): any {
-  // Build services array for the group
-  const services: any[] = [];
-
-  for (const [serviceName, service] of Object.entries<any>(sdl.services)) {
-    const resources = sdl.profiles.compute[serviceName]?.resources || {};
-
-    // Get CPU value in millicores, strip 'm' suffix if present
-    const cpuMillicores = resources.cpu?.units?.replace(/m$/, "") || "1000";
-
-    // Get memory value in bytes
-    const memoryBytes = resources.memory?.size
-      ? parseStorageSize(resources.memory.size)
-      : "536870912";
-
-    services.push({
-      name: serviceName,
-      image: service.image,
-      command: service.command || null,
-      args: service.args || null,
-      env: service.env?.map((e: string) => {
-        const [key, ...valueParts] = e.split("=");
-        return { name: key, value: valueParts.join("=") };
-      }) || null,
-      resources: {
-        id: 1,
-        cpu: {
-          units: { val: cpuMillicores },
-          attributes: [],
-        },
-        memory: {
-          quantity: { val: memoryBytes },
-          attributes: [],
-        },
-        storage: (resources.storage || [{ size: "1Gi" }]).map((s: any) => ({
-          name: "default",
-          quantity: { val: parseStorageSize(s.size) },
-          attributes: [],
-        })),
-        gpu: {
-          units: { val: resources.gpu?.units || "0" },
-          attributes: resources.gpu?.model
-            ? [{ key: "vendor/nvidia/model", value: resources.gpu.model }]
-            : [],
-        },
-        endpoints: [],
-      },
-      count: 1,
-      expose: service.expose?.map((e: any) => ({
-        port: e.port,
-        externalPort: e.as || e.port,
-        proto: (e.proto || "TCP").toUpperCase(),
-        service: serviceName,
-        global: e.to?.some((t: any) => t.global) || false,
-        hosts: null,
-      })) || [],
-    });
-  }
-
-  // Return manifest as array of groups (we use one group named "dcloud")
-  return [
-    {
-      name: "dcloud",
-      services,
-    },
-  ];
 }
 
 /**
@@ -576,60 +561,3 @@ async function getDeploymentEndpoints(
   }
 }
 
-/**
- * Parse storage size string to bytes string (for manifest)
- */
-function parseStorageSize(size: string): string {
-  return parseBytes(size).toString();
-}
-
-/**
- * Parse bytes from size string
- */
-function parseBytes(size: string): number {
-  const units: Record<string, number> = {
-    "b": 1,
-    "kb": 1024,
-    "mb": 1024 * 1024,
-    "gb": 1024 * 1024 * 1024,
-    "tb": 1024 * 1024 * 1024 * 1024,
-    "ki": 1024,
-    "mi": 1024 * 1024,
-    "gi": 1024 * 1024 * 1024,
-    "ti": 1024 * 1024 * 1024 * 1024,
-  };
-
-  const match = size.match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|Ki|Mi|Gi|Ti)?$/i);
-  if (!match) {
-    throw new Error(`Invalid size format: ${size}`);
-  }
-
-  const value = parseFloat(match[1]);
-  const unit = (match[2] || "B").toLowerCase();
-  const multiplier = units[unit] || 1;
-
-  return Math.floor(value * multiplier);
-}
-
-/**
- * Calculate hourly price for specs (in micro USDC)
- */
-function calculateHourlyPrice(specs: ComputeSpecs): number {
-  const memoryBytes = parseBytes(specs.memory);
-  const storageBytes = parseBytes(specs.storage);
-
-  const cpuCost = specs.cpu * 50000; // $0.05 per CPU
-  const memoryCostPerGi = 10000; // $0.01 per Gi
-  const storageCostPerGi = 5000; // $0.005 per Gi
-  const gpuCost = specs.gpu ? specs.gpu.count * 500000 : 0; // $0.50 per GPU
-
-  const memoryGi = memoryBytes / (1024 * 1024 * 1024);
-  const storageGi = storageBytes / (1024 * 1024 * 1024);
-
-  return Math.ceil(
-    cpuCost +
-    memoryCostPerGi * memoryGi +
-    storageCostPerGi * storageGi +
-    gpuCost
-  );
-}
