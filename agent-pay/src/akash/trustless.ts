@@ -132,40 +132,26 @@ export async function simulateGas(params: {
 
   const registry = getRegistry();
 
-  // Encode messages into TxBody
+  // Encode messages as Any for the simulate RPC
   const encodedMsgs = messages.map((msg) => registry.encodeAsAny(msg));
-  const txBody = TxBody.fromPartial({ messages: encodedMsgs, memo });
-  const bodyBytes = TxBody.encode(txBody).finish();
 
-  // Build AuthInfo with the real pubkey but dummy fee
-  const pubkeyEncoded = encodePubkey({
+  // The query client's tx.simulate expects (messages, memo, signerPubkey, sequence)
+  // where signerPubkey is an amino-style pubkey { type, value }
+  const aminoPubkey = {
     type: "tendermint/PubKeySecp256k1",
     value: Buffer.from(senderPubkey).toString("base64"),
-  });
+  };
 
-  const authInfoBytes = makeAuthInfoBytes(
-    [{ pubkey: pubkeyEncoded, sequence }],
-    [{ denom: "uakt", amount: "0" }],
-    0, // gasLimit = 0 for simulation
-    undefined, // feeGranter
-    undefined, // feePayer
-  );
-
-  // Build TxRaw with a dummy 64-byte zero signature
-  const dummySignature = new Uint8Array(64);
-  const txRaw = TxRaw.fromPartial({
-    bodyBytes,
-    authInfoBytes,
-    signatures: [dummySignature],
-  });
-  const txBytes = TxRaw.encode(txRaw).finish();
-
-  // Call simulate via the query client
   const client = await getStargateClient(network);
   const queryClient = (client as any).forceGetQueryClient();
 
   try {
-    const simResult = await queryClient.tx.simulate(txBytes);
+    const simResult = await queryClient.tx.simulate(
+      encodedMsgs,
+      memo,
+      aminoPubkey,
+      sequence,
+    );
     const gasUsed = Number(simResult.gasInfo?.gasUsed ?? 0);
     const estimated = Math.ceil(gasUsed * 1.3); // 1.3x multiplier
 
@@ -467,7 +453,7 @@ export function constructAminoJwtSignDoc(
   const now = Math.floor(Date.now() / 1000);
 
   // JWT header
-  const header = { alg: "AKASH_AMINO_ADR_036", typ: "JWT" };
+  const header = { alg: "ES256KADR36", typ: "JWT" };
   const jwtHeader = base64url(JSON.stringify(header));
 
   // JWT payload
@@ -516,30 +502,30 @@ export function constructAminoJwtSignDoc(
 
 /**
  * Assemble a complete JWT token from the header, payload, and Agent A's amino signature.
- * The signature is the base64url-encoded compact signature with the pubkey appended.
+ *
+ * The third segment is the raw 64-byte signature in base64url — matching the chain-sdk
+ * JwtTokenManager format. The provider obtains the public key from the on-chain account
+ * (published when the first TX was sent), so the pubkey is NOT embedded in the JWT.
  */
 export function assembleJwt(
   jwtHeader: string,
   jwtPayload: string,
-  signature: string, // hex, 64 bytes
-  pubkey: Uint8Array   // compressed 33-byte secp256k1
+  signature: string, // hex, 64 bytes (r||s)
+  _pubkey?: Uint8Array  // unused — kept for backward compat, provider gets pubkey from chain
 ): string {
   // Strip 0x prefix if present
   const sigHex = signature.startsWith("0x") ? signature.slice(2) : signature;
   const sigBytes = fromHex(sigHex);
 
-  // Cosmos amino signature format for JWT:
-  // The signature section of the JWT contains:
-  // { "pub_key": { "type": "tendermint/PubKeySecp256k1", "value": "<base64>" }, "signature": "<base64>" }
-  const jwtSigPayload = {
-    pub_key: {
-      type: "tendermint/PubKeySecp256k1",
-      value: Buffer.from(pubkey).toString("base64"),
-    },
-    signature: Buffer.from(sigBytes).toString("base64"),
-  };
+  // The JWT signature segment is base64url(rawSignatureBytes) — just the raw 64-byte
+  // secp256k1 signature. This matches how @akashnetwork/chain-sdk's JwtTokenManager
+  // encodes it: toBase64Url(StdSignature.signature), which is base64url of the raw sig.
+  const sigBase64 = Buffer.from(sigBytes).toString("base64");
+  const jwtSignature = sigBase64
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 
-  const jwtSignature = base64url(JSON.stringify(jwtSigPayload));
   const jwt = `${jwtHeader}.${jwtPayload}.${jwtSignature}`;
 
   console.error(`[agent-pay:trustless:assembleJwt] Assembled JWT token`);

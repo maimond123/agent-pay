@@ -27,6 +27,7 @@ import {
   promptPassword,
   getEvmBalance,
   createEvmWalletClient,
+  createEvmPublicClient,
   loadBudget,
   saveBudget,
   getBudgetSummary,
@@ -42,6 +43,14 @@ import {
 import { createSkipBridge, getSkipTransactions, createSkipRoute, trackSkipTransaction, waitForSkipBridgeCompletion, signAndBroadcastCosmosTx, SKIP_CHAINS } from "./bridge/index.js";
 import { fromBech32, toBech32 } from "@cosmjs/encoding";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
+import {
+  buildAgentMetadata,
+  uploadToIPFS,
+  registerAgent,
+  getAgentId,
+  getAgentURI,
+  IDENTITY_REGISTRY_ADDRESS,
+} from "./erc8004/index.js";
 
 // Debug logging — set SKIP_DEBUG=1 to enable verbose logging
 const CLI_DEBUG = process.env.SKIP_DEBUG === "1";
@@ -1703,6 +1712,113 @@ async function walletBudget() {
 }
 
 // ============================================================================
+// REGISTER COMMAND (ERC-8004)
+// ============================================================================
+
+const AGENT_ID_PATH = join(homedir(), ".agent-pay", "agent-id.json");
+
+async function register() {
+  const args = process.argv.slice(3);
+  const getArg = (name: string): string | undefined => {
+    const index = args.indexOf(`--${name}`);
+    return index !== -1 ? args[index + 1] : undefined;
+  };
+
+  const endpoint = getArg("endpoint");
+  if (!endpoint) {
+    console.error("Usage: npx @agent-pay/mcp register --endpoint <mcp-url>");
+    console.error("");
+    console.error("Example:");
+    console.error("  npx @agent-pay/mcp register --endpoint https://your-domain.trycloudflare.com/mcp");
+    console.error("");
+    console.error("Requires:");
+    console.error("  - PINATA_JWT env var (free at https://app.pinata.cloud)");
+    console.error("  - ETH on Base for gas (~$0.01)");
+    process.exit(1);
+  }
+
+  // 1. Check wallet
+  const akashAddress = getDefaultWalletAddress();
+  if (!akashAddress) {
+    console.error("No wallet found. Create one first:");
+    console.error("  npx @agent-pay/mcp wallet create");
+    process.exit(1);
+  }
+
+  const { evmAccount, evmAddress } = await getOrUnlockWallet(akashAddress);
+  const evmWalletClient = createEvmWalletClient(evmAccount);
+  const publicClient = createEvmPublicClient();
+
+  console.log("");
+  console.log("╔═══════════════════════════════════════════════════════════════╗");
+  console.log("║              ERC-8004 Agent Registration                      ║");
+  console.log("╚═══════════════════════════════════════════════════════════════╝");
+  console.log("");
+  console.log(`  EVM Address:    ${evmAddress}`);
+  console.log(`  Akash Address:  ${akashAddress}`);
+  console.log(`  MCP Endpoint:   ${endpoint}`);
+  console.log("");
+
+  // 2. Check if already registered
+  const existingAgentId = await getAgentId(publicClient, evmAddress as `0x${string}`);
+  if (existingAgentId !== null) {
+    const uri = await getAgentURI(publicClient, existingAgentId);
+    const fullId = `eip155:8453:${IDENTITY_REGISTRY_ADDRESS}#${existingAgentId}`;
+
+    console.log("  Already registered!");
+    console.log("");
+    console.log(`  Agent ID:       ${existingAgentId}`);
+    console.log(`  Full ID:        ${fullId}`);
+    console.log(`  Metadata URI:   ${uri}`);
+    console.log("");
+    return;
+  }
+
+  // 3. Build metadata
+  console.log("  Step 1/3: Building agent metadata...");
+  const metadata = buildAgentMetadata(endpoint);
+
+  // 4. Upload to IPFS
+  console.log("  Step 2/3: Uploading to IPFS via Pinata...");
+  const ipfsURI = await uploadToIPFS(metadata);
+  console.log(`  IPFS URI: ${ipfsURI}`);
+
+  // 5. Register on-chain
+  console.log("  Step 3/3: Registering on Base mainnet...");
+  const { txHash, agentId } = await registerAgent(
+    evmWalletClient,
+    publicClient,
+    evmAccount,
+    ipfsURI
+  );
+
+  const fullId = `eip155:8453:${IDENTITY_REGISTRY_ADDRESS}#${agentId}`;
+
+  // 6. Store locally
+  const registrationData = {
+    agentId: agentId.toString(),
+    fullId,
+    txHash,
+    ipfsURI,
+    endpoint,
+    registeredAt: new Date().toISOString(),
+  };
+  writeFileSync(AGENT_ID_PATH, JSON.stringify(registrationData, null, 2));
+
+  console.log("");
+  console.log("  Registration complete!");
+  console.log("");
+  console.log(`  Agent ID:       ${agentId}`);
+  console.log(`  Full ID:        ${fullId}`);
+  console.log(`  TX Hash:        ${txHash}`);
+  console.log(`  IPFS URI:       ${ipfsURI}`);
+  console.log(`  MCP Endpoint:   ${endpoint}`);
+  console.log("");
+  console.log(`  View on Basescan: https://basescan.org/tx/${txHash}`);
+  console.log("");
+}
+
+// ============================================================================
 // HELP COMMAND
 // ============================================================================
 
@@ -1745,6 +1861,10 @@ Commands:
     --max-total <usd>        Lifetime cap (default: 500)
     --approval-above <usd>   Prompt user above this amount (default: 25)
 
+  register                   Register as an ERC-8004 agent on Base
+    --endpoint <url>         Your public MCP endpoint URL (required)
+                             Requires PINATA_JWT env var + ETH on Base for gas
+
 Examples:
   npx @agent-pay/mcp wallet create
   npx @agent-pay/mcp wallet balance
@@ -1754,6 +1874,7 @@ Examples:
   npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04 --port 22
   npx @agent-pay/mcp status 12345678
   npx @agent-pay/mcp close 12345678
+  npx @agent-pay/mcp register --endpoint https://your-domain.com/mcp
 `);
 }
 
@@ -1813,6 +1934,11 @@ if (command === "wallet") {
 } else if (command === "bridge-resume") {
   bridgeResume().catch((error) => {
     console.error("Bridge resume failed:", error);
+    process.exit(1);
+  });
+} else if (command === "register") {
+  register().catch((error) => {
+    console.error("Registration failed:", error);
     process.exit(1);
   });
 } else if (command === "--help" || command === "-h" || !command) {
