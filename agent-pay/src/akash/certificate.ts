@@ -26,7 +26,7 @@ import { createSigningClient } from "./sdk-client.js";
 
 const CERT_DIR = join(homedir(), ".agent-pay", "certs");
 
-interface StoredCert {
+export interface StoredCert {
   cert: string;      // PEM-encoded x509 certificate
   publicKey: string;  // PEM-encoded public key
   privateKey: string; // PEM-encoded private key
@@ -135,6 +135,61 @@ export function createMtlsAgent(cert: StoredCert): https.Agent {
  * Fetch with mTLS client certificate + JWT bearer token authentication.
  * Uses Node.js https module directly since global fetch doesn't support client certs easily.
  */
+/**
+ * Generate a certificate key pair for a given Akash address without broadcasting.
+ * Used by the trustless flow where Agent A signs the broadcast TX externally.
+ */
+export async function generateCertificateKeyPair(
+  address: string
+): Promise<{ cert: string; publicKey: string; privateKey: string }> {
+  console.error(
+    `[agent-pay:certificate:generateCertificateKeyPair] Generating cert for ${address}`
+  );
+  const pem = await createCertificate(address);
+  return {
+    cert: pem.cert,
+    publicKey: pem.publicKey,
+    privateKey: pem.privateKey,
+  };
+}
+
+/**
+ * Load a stored certificate from disk for a given Akash address.
+ * Returns null if no cert exists.
+ */
+export function loadStoredCert(akashAddress: string): StoredCert | null {
+  const certPath = join(CERT_DIR, `${akashAddress}.json`);
+  if (!existsSync(certPath)) {
+    return null;
+  }
+  return JSON.parse(readFileSync(certPath, "utf8"));
+}
+
+/**
+ * Save a certificate to disk for a given Akash address.
+ */
+export function saveStoredCert(
+  akashAddress: string,
+  cert: StoredCert
+): void {
+  if (!existsSync(CERT_DIR)) {
+    mkdirSync(CERT_DIR, { recursive: true });
+  }
+  const certPath = join(CERT_DIR, `${akashAddress}.json`);
+  writeFileSync(certPath, JSON.stringify(cert, null, 2));
+}
+
+/**
+ * Delete a stored certificate from disk.
+ */
+export function deleteStoredCert(akashAddress: string): void {
+  const certPath = join(CERT_DIR, `${akashAddress}.json`);
+  if (existsSync(certPath)) {
+    const { unlinkSync } = require("fs");
+    unlinkSync(certPath);
+  }
+}
+
 export async function mtlsFetch(
   url: string,
   cert: StoredCert,

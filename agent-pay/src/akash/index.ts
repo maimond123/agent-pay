@@ -8,6 +8,7 @@
 export {
   deployToAkash,
   closeDeployment,
+  generateSDLYaml,
   DeploymentState,
   LeaseState,
   type DeploymentResult,
@@ -39,8 +40,13 @@ export {
 // Certificate - mTLS + JWT authentication with providers
 export {
   getOrCreateCertificate,
+  generateCertificateKeyPair,
+  loadStoredCert,
+  saveStoredCert,
+  deleteStoredCert,
   generateProviderJwt,
   mtlsFetch,
+  type StoredCert,
 } from "./certificate.js";
 
 // SDL Generator - manifest creation
@@ -51,3 +57,19 @@ export {
   buildDeploymentGroups,
   type SDLSpec,
 } from "./sdl-generator.js";
+
+// Trustless TX construction + broadcast
+export {
+  queryAccountInfo,
+  simulateGas,
+  constructUnsignedTx,
+  broadcastSignedTx,
+  constructDeploymentMsg,
+  constructLeaseMsg,
+  constructCloseMsg,
+  constructCertificateMsg,
+  constructAminoJwtSignDoc,
+  assembleJwt,
+  type UnsignedTxResult,
+  type BroadcastResult,
+} from "./trustless.js";

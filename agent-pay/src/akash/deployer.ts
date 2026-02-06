@@ -89,7 +89,7 @@ function sleep(ms: number): Promise<void> {
  * Generate SDL YAML string from compute specs
  * This format is understood by the chain-sdk SDL parser
  */
-function generateSDLYaml(
+export function generateSDLYaml(
   specs: ComputeSpecs,
   env?: Record<string, string>,
   command?: string[]

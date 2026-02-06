@@ -18,6 +18,7 @@ import { join } from "path";
 import * as readline from "readline";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { Secp256k1HdWallet } from "@cosmjs/amino";
+import { deriveEvmAccount, type HDAccount } from "./evm-wallet.js";
 
 // Storage directory
 const WALLET_DIR = join(homedir(), ".agent-pay", "wallets");
@@ -28,6 +29,8 @@ const SESSION_DURATION_MS = 4 * 60 * 60 * 1000; // 4 hours
 interface WalletSession {
   wallet: DirectSecp256k1HdWallet;
   aminoWallet: Secp256k1HdWallet;  // For JWT signing
+  evmAccount: HDAccount;
+  evmAddress: `0x${string}`;
   address: string;
   unlockedAt: number;
   expiresAt: number;
@@ -40,6 +43,7 @@ let activeSession: WalletSession | null = null;
  */
 export interface StoredWallet {
   address: string;
+  evmAddress?: string;           // Base (EVM) address — optional for backward compat
   encryptedMnemonic: string;
   salt: string;
   iv: string;
@@ -170,7 +174,8 @@ export function saveWallet(
   address: string,
   mnemonic: string,
   password: string,
-  network: string = "akash-mainnet"
+  network: string = "akash-mainnet",
+  evmAddress?: string
 ): string {
   // Ensure directory exists
   if (!existsSync(WALLET_DIR)) {
@@ -183,6 +188,7 @@ export function saveWallet(
   // Create stored wallet object
   const storedWallet: StoredWallet = {
     address,
+    ...(evmAddress ? { evmAddress } : {}),
     encryptedMnemonic: encrypted,
     salt,
     iv,
@@ -205,7 +211,12 @@ export function saveWallet(
 export async function loadWallet(
   address: string,
   password: string
-): Promise<{ wallet: DirectSecp256k1HdWallet; aminoWallet: Secp256k1HdWallet }> {
+): Promise<{
+  wallet: DirectSecp256k1HdWallet;
+  aminoWallet: Secp256k1HdWallet;
+  evmAccount: HDAccount;
+  evmAddress: `0x${string}`;
+}> {
   const filePath = join(WALLET_DIR, `${address}.json`);
 
   if (!existsSync(filePath)) {
@@ -236,8 +247,16 @@ export async function loadWallet(
     prefix: "akash",
   });
 
+  // Derive EVM account from the same mnemonic
+  const { evmAccount, evmAddress } = deriveEvmAccount(mnemonic);
+
+  // Lazily populate evmAddress on old wallet files
+  if (!stored.evmAddress) {
+    migrateWalletAddEvmAddress(address, evmAddress);
+  }
+
   // Mnemonic goes out of scope here - garbage collected
-  return { wallet, aminoWallet };
+  return { wallet, aminoWallet, evmAccount, evmAddress };
 }
 
 /**
@@ -247,7 +266,12 @@ export async function loadWallet(
  */
 export async function getOrUnlockWallet(
   address: string
-): Promise<{ wallet: DirectSecp256k1HdWallet; aminoWallet: Secp256k1HdWallet }> {
+): Promise<{
+  wallet: DirectSecp256k1HdWallet;
+  aminoWallet: Secp256k1HdWallet;
+  evmAccount: HDAccount;
+  evmAddress: `0x${string}`;
+}> {
   // Check for valid session
   if (
     activeSession &&
@@ -258,26 +282,33 @@ export async function getOrUnlockWallet(
       (activeSession.expiresAt - Date.now()) / 60000
     );
     console.log(`Using unlocked wallet (${remaining} min remaining)`);
-    return { wallet: activeSession.wallet, aminoWallet: activeSession.aminoWallet };
+    return {
+      wallet: activeSession.wallet,
+      aminoWallet: activeSession.aminoWallet,
+      evmAccount: activeSession.evmAccount,
+      evmAddress: activeSession.evmAddress,
+    };
   }
 
   // Need to unlock
   console.log("🔐 Wallet locked. Enter password to unlock.");
   const password = await promptPassword("Password: ");
 
-  const { wallet, aminoWallet } = await loadWallet(address, password);
+  const { wallet, aminoWallet, evmAccount, evmAddress } = await loadWallet(address, password);
 
   // Create session
   activeSession = {
     wallet,
     aminoWallet,
+    evmAccount,
+    evmAddress,
     address,
     unlockedAt: Date.now(),
     expiresAt: Date.now() + SESSION_DURATION_MS,
   };
 
   console.log("✓ Wallet unlocked for 4 hours");
-  return { wallet, aminoWallet };
+  return { wallet, aminoWallet, evmAccount, evmAddress };
 }
 
 /**
@@ -319,6 +350,37 @@ export function walletExists(address: string): boolean {
 export function getDefaultWalletAddress(): string | null {
   const wallets = listStoredWallets();
   return wallets.length > 0 ? wallets[0].address : null;
+}
+
+/**
+ * Read evmAddress from a stored wallet JSON without decryption.
+ * Returns undefined if the wallet file doesn't exist or has no evmAddress.
+ */
+export function getStoredEvmAddress(akashAddress: string): string | undefined {
+  const filePath = join(WALLET_DIR, `${akashAddress}.json`);
+  if (!existsSync(filePath)) return undefined;
+  try {
+    const stored: StoredWallet = JSON.parse(readFileSync(filePath, "utf8"));
+    return stored.evmAddress;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Lazily populate evmAddress on old wallet files (no decryption needed —
+ * called from loadWallet after the mnemonic has already been decrypted).
+ */
+function migrateWalletAddEvmAddress(akashAddress: string, evmAddress: string): void {
+  const filePath = join(WALLET_DIR, `${akashAddress}.json`);
+  if (!existsSync(filePath)) return;
+  try {
+    const stored: StoredWallet = JSON.parse(readFileSync(filePath, "utf8"));
+    stored.evmAddress = evmAddress;
+    writeFileSync(filePath, JSON.stringify(stored, null, 2));
+  } catch {
+    // Non-fatal — evmAddress will be populated on next unlock
+  }
 }
 
 // Auto-lock on process exit

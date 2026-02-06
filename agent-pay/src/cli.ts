@@ -22,8 +22,15 @@ import {
   saveWallet,
   listStoredWallets,
   getDefaultWalletAddress,
+  getStoredEvmAddress,
   getOrUnlockWallet,
   promptPassword,
+  getEvmBalance,
+  createEvmWalletClient,
+  loadBudget,
+  saveBudget,
+  getBudgetSummary,
+  type BudgetConfig,
 } from "./wallet/index.js";
 import {
   deployToAkash,
@@ -114,6 +121,7 @@ const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 interface Config {
   walletAddress?: string;
   akashAddress?: string;
+  evmAddress?: string;
   network?: string;
   evmNetwork?: string;
 }
@@ -224,7 +232,7 @@ async function walletCreate() {
 
   // Generate new wallet
   console.log("Generating new wallet...\n");
-  const { address, mnemonic, pubkey } = await createAkashWallet();
+  const { address, evmAddress, mnemonic, pubkey } = await createAkashWallet();
 
   console.log("╔═══════════════════════════════════════════════════════════════╗");
   console.log("║  IMPORTANT: Write down your recovery phrase!                  ║");
@@ -247,12 +255,13 @@ async function walletCreate() {
     process.exit(1);
   }
 
-  // Save encrypted wallet
-  const walletPath = saveWallet(address, mnemonic, password);
+  // Save encrypted wallet (with EVM address)
+  const walletPath = saveWallet(address, mnemonic, password, "akash-mainnet", evmAddress);
 
   // Update config
   const config = loadConfig();
   config.akashAddress = address;
+  config.evmAddress = evmAddress;
   saveConfig(config);
 
   console.log(`
@@ -260,15 +269,23 @@ async function walletCreate() {
 ║                  Wallet Created Successfully!                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-  Address: ${address}
-  Saved:   ${walletPath}
+  Akash Address: ${address}
+  Base Address:  ${evmAddress}
+  Saved:         ${walletPath}
+
+  Same mnemonic, two keypairs:
+    Cosmos (m/44'/118'/0'/0/0) → ${address}
+    EVM    (m/44'/60'/0'/0/0)  → ${evmAddress}
 
 Next steps:
 
-  1. Fund your wallet by bridging USDC from Base:
+  1. Send USDC to your Base address for ERC-8004 payments:
+     ${evmAddress}
+
+  2. Or bridge USDC from Base to Akash for compute:
      npx @agent-pay/mcp bridge --amount 10
 
-  2. Then provision compute:
+  3. Then provision compute:
      npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04
 `);
 }
@@ -296,7 +313,10 @@ async function walletList() {
 
   for (const wallet of wallets) {
     const isDefault = wallet.address === defaultAddress ? " (default)" : "";
-    console.log(`  ${wallet.address}${isDefault}`);
+    console.log(`  Akash: ${wallet.address}${isDefault}`);
+    if (wallet.evmAddress) {
+      console.log(`  Base:  ${wallet.evmAddress}`);
+    }
     console.log(`    Created: ${wallet.createdAt}`);
     console.log(`    Network: ${wallet.network}`);
     console.log("");
@@ -326,22 +346,43 @@ async function walletBalance(addressArg?: string) {
   const isTestnet = process.argv.includes("--testnet");
   const network = isTestnet ? "testnet" : "mainnet";
 
-  console.log(`Address: ${address}`);
+  console.log(`Akash Address: ${address}`);
+
+  // Look up the EVM address
+  const evmAddr = getStoredEvmAddress(address);
+  if (evmAddr) {
+    console.log(`Base Address:  ${evmAddr}`);
+  }
   console.log(`Network: ${network}\n`);
 
   try {
+    // Query Akash balances
     const balance = await getWalletBalance(address, network);
 
-    console.log("Balances:");
+    console.log("Akash Balances:");
     console.log(`  USDC:  ${balance.usdcFormatted} axlUSDC`);
     console.log(`  AKT:   ${balance.uaktFormatted} AKT`);
     console.log("");
+
+    // Query Base (EVM) balances if we have an EVM address
+    if (evmAddr) {
+      try {
+        const evmBalance = await getEvmBalance(evmAddr as `0x${string}`);
+        console.log("Base Balances:");
+        console.log(`  USDC:  ${evmBalance.usdcFormatted} USDC`);
+        console.log(`  ETH:   ${evmBalance.ethFormatted} ETH`);
+        console.log("");
+      } catch (evmErr) {
+        console.log("Base Balances: (failed to fetch)");
+        console.log("");
+      }
+    }
 
     const usdcBalance = parseFloat(balance.usdcFormatted);
     const aktBalance = parseFloat(balance.uaktFormatted);
 
     if (usdcBalance < 1.0) {
-      console.log("Your USDC balance is low. Bridge more funds:");
+      console.log("Your Akash USDC balance is low. Bridge more funds:");
       console.log("  npx @agent-pay/mcp bridge --amount 10");
     }
 
@@ -709,6 +750,7 @@ async function bridge() {
   const amount = getArg("amount") || "10";
   const evmNetwork = getArg("evm-network") || "base";
   const destinationType = (getArg("receive") || "akt") as "akt" | "usdc";
+  const isDirect = args.includes("--direct");
 
   // Get Akash address
   const akashAddress = getDefaultWalletAddress();
@@ -724,8 +766,15 @@ async function bridge() {
   console.log(`  To: Akash (${akashAddress})`);
   console.log(`  Receive: ${destinationType.toUpperCase()}`);
   console.log(`  Bridge: Skip Go (Noble CCTP + IBC)`);
+  console.log(`  Mode: ${isDirect ? "Direct (agent wallet signs)" : "WalletConnect (external wallet signs)"}`);
   console.log(`  Estimated fee: ~$0.02`);
   console.log("");
+
+  // ── Direct mode: sign EVM tx with the agent's own wallet ──
+  if (isDirect) {
+    await bridgeDirect(akashAddress, amount, evmNetwork, destinationType);
+    return;
+  }
 
   // Initialize WalletConnect for EVM signing
   console.log("Connect your EVM wallet to sign the bridge transaction:\n");
@@ -1385,6 +1434,275 @@ Your Akash wallet should now have the funds.
 }
 
 // ============================================================================
+// BRIDGE DIRECT — signs EVM tx with agent's own wallet (no WalletConnect)
+// ============================================================================
+
+async function bridgeDirect(
+  akashAddress: string,
+  amount: string,
+  evmNetwork: string,
+  destinationType: "akt" | "usdc"
+) {
+  // Unlock wallet to get the EVM account
+  console.log("Unlocking agent wallet for direct EVM signing...\n");
+  const { evmAccount, evmAddress } = await getOrUnlockWallet(akashAddress);
+  const walletAddress = evmAddress;
+
+  console.log(`Agent EVM address: ${walletAddress}\n`);
+
+  try {
+    // Create bridge route
+    console.log("Creating bridge route via Skip Go...\n");
+    const bridgeResult = await createSkipBridge({
+      fromAddress: walletAddress,
+      toAddress: akashAddress,
+      amountUSDC: amount,
+      destinationType,
+      slippagePercent: "3",
+    });
+
+    const { route, transactions } = bridgeResult;
+
+    const outputAmount = (parseInt(route.estimatedAmountOut) / 1_000_000).toFixed(6);
+    const outputToken = destinationType === "akt" ? "AKT" : "USDC";
+
+    console.log(`Route created:`);
+    console.log(`  Estimated received: ${outputAmount} ${outputToken}`);
+    console.log(`  Total fees: $${route.fees.totalUsd}`);
+    console.log(`  Estimated time: ~${Math.round(route.estimatedDurationSeconds / 60)} minutes`);
+    console.log(`  Route: ${route.chainPath.join(" → ")}`);
+    console.log("");
+
+    // Get the EVM transaction
+    const evmTx = transactions.find(tx => tx.txType === "evm" && tx.evmTx);
+    if (!evmTx?.evmTx) throw new Error("No EVM transaction found in route");
+
+    const usdcAddress = USDC_ADDRESSES[evmNetwork] || USDC_ADDRESSES["base"];
+    const chain = CHAINS[evmNetwork] || CHAINS["base"];
+    const amountInMicro = parseUnits(amount, 6);
+    const skipContractAddress = evmTx.evmTx.to as `0x${string}`;
+
+    // Create viem clients
+    const evmWalletClient = createEvmWalletClient(evmAccount);
+    const publicClient = createPublicClient({ chain, transport: http() });
+
+    // Check balance
+    const currentBalance = await publicClient.readContract({
+      address: usdcAddress,
+      abi: ERC20_ABI,
+      functionName: "balanceOf",
+      args: [walletAddress],
+    });
+
+    const balanceFormatted = Number(currentBalance) / 1e6;
+    console.log(`  USDC Balance: ${balanceFormatted.toFixed(6)} USDC`);
+
+    if (currentBalance < amountInMicro) {
+      console.error(`\nInsufficient USDC balance!`);
+      console.error(`  You have: ${balanceFormatted.toFixed(6)} USDC`);
+      console.error(`  Required: ${amount} USDC`);
+      console.error(`\nSend USDC to your agent wallet: ${walletAddress}`);
+      process.exit(1);
+    }
+
+    // Check allowance
+    const currentAllowance = await publicClient.readContract({
+      address: usdcAddress,
+      abi: ERC20_ABI,
+      functionName: "allowance",
+      args: [walletAddress, skipContractAddress],
+    });
+
+    if (currentAllowance < amountInMicro) {
+      console.log("\nApproving USDC spending...\n");
+      const maxApproval = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+      const approveData = encodeFunctionData({
+        abi: ERC20_ABI,
+        functionName: "approve",
+        args: [skipContractAddress, maxApproval],
+      });
+
+      const approveTxHash = await evmWalletClient.sendTransaction({
+        account: evmAccount,
+        chain: base,
+        to: usdcAddress,
+        data: approveData,
+      });
+      console.log(`Approval submitted: ${approveTxHash}`);
+      console.log("Waiting for confirmation...\n");
+      await publicClient.waitForTransactionReceipt({ hash: approveTxHash });
+      console.log("Approval confirmed.\n");
+    } else {
+      console.log(`Allowance OK: ${Number(currentAllowance) / 1e6} USDC\n`);
+    }
+
+    // Execute bridge transaction
+    console.log("Executing bridge transaction...\n");
+    const bridgeTxHash = await evmWalletClient.sendTransaction({
+      account: evmAccount,
+      chain: base,
+      to: evmTx.evmTx.to as `0x${string}`,
+      data: evmTx.evmTx.data as `0x${string}`,
+      value: evmTx.evmTx.value ? BigInt(evmTx.evmTx.value) : 0n,
+    });
+
+    console.log(`Bridge transaction submitted: ${bridgeTxHash}\n`);
+
+    // Register with Skip relay
+    console.log("Registering with Skip relay...\n");
+    try {
+      const trackResult = await trackSkipTransaction(bridgeTxHash, SKIP_CHAINS.BASE_MAINNET);
+      console.log(`Explorer: ${trackResult.explorerLink}\n`);
+    } catch (trackError: any) {
+      console.warn(`Warning: Could not register with Skip relay: ${trackError.message}\n`);
+    }
+
+    // Wait for Phase 1 completion
+    console.log("Waiting for bridge completion...\n");
+    const status = await waitForSkipBridgeCompletion(
+      bridgeTxHash,
+      SKIP_CHAINS.BASE_MAINNET,
+      { timeoutMs: 1800000, pollIntervalMs: 15000, chainPath: route.chainPath }
+    );
+    console.log("");
+
+    // Phase 2: Cosmos IBC txs
+    const cosmosTxs = transactions.filter(tx => tx.txType === "cosmos" && tx.cosmosTx);
+
+    if (status.status === "success" && cosmosTxs.length > 0) {
+      console.log("Phase 1 complete (CCTP: Base -> Noble).\n");
+      console.log("Starting Phase 2: IBC transfer...\n");
+
+      const { wallet: akashWallet } = await getOrUnlockWallet(akashAddress);
+      const nobleWallet = await DirectSecp256k1HdWallet.fromMnemonic(
+        (akashWallet as any).mnemonic,
+        { prefix: "noble" }
+      );
+      const [nobleAccount] = await nobleWallet.getAccounts();
+      console.log(`Noble address: ${nobleAccount.address}\n`);
+
+      for (let i = 0; i < cosmosTxs.length; i++) {
+        const cosmosTx = cosmosTxs[i];
+        console.log(`Signing cosmos tx ${i + 1}/${cosmosTxs.length} on ${cosmosTx.chainId}...\n`);
+
+        const cosmosResult = await signAndBroadcastCosmosTx(nobleWallet, cosmosTx.cosmosTx!);
+        console.log(`\nNoble tx broadcast: ${cosmosResult.txHash}\n`);
+
+        try {
+          const nobleTrack = await trackSkipTransaction(cosmosResult.txHash, cosmosResult.chainId, { initialDelayMs: 3000, maxRetries: 5 });
+          console.log(`Explorer: ${nobleTrack.explorerLink}\n`);
+        } catch {}
+
+        console.log("Waiting for IBC transfer...\n");
+        const ibcStatus = await waitForSkipBridgeCompletion(
+          cosmosResult.txHash,
+          cosmosResult.chainId,
+          {
+            timeoutMs: 600000,
+            pollIntervalMs: 10000,
+            chainPath: route.chainPath.filter(c => c !== SKIP_CHAINS.BASE_MAINNET),
+          }
+        );
+        console.log("");
+
+        if (ibcStatus.status === "success") {
+          console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Bridge Complete! (Direct)                    ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Sent: ${amount} USDC (signed by agent wallet)
+  Received: ~${outputAmount} ${outputToken}
+  To: ${akashAddress}
+  Phase 1 TX: ${bridgeTxHash}
+  Phase 2 TX: ${cosmosResult.txHash}
+`);
+        } else {
+          console.error(`\nIBC transfer ${ibcStatus.status}. Noble TX: ${cosmosResult.txHash}`);
+          printIntermediateAddresses(akashAddress, route.chainPath);
+          process.exit(1);
+        }
+      }
+    } else if (status.status === "success") {
+      console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                  Bridge Complete! (Direct)                    ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  Sent: ${amount} USDC (signed by agent wallet)
+  Received: ~${outputAmount} ${outputToken}
+  To: ${akashAddress}
+  TX: ${bridgeTxHash}
+`);
+    } else {
+      console.error(`\nBridge ${status.status}. TX: ${bridgeTxHash}`);
+      printIntermediateAddresses(akashAddress, route.chainPath);
+      process.exit(1);
+    }
+  } catch (error: any) {
+    console.error("\nDirect bridge failed:", error.message || String(error));
+    process.exit(1);
+  }
+}
+
+// ============================================================================
+// WALLET BUDGET COMMAND
+// ============================================================================
+
+async function walletBudget() {
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                    Budget Configuration                       ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+  const args = process.argv.slice(3);
+  const getArg = (name: string): string | undefined => {
+    const index = args.indexOf(`--${name}`);
+    return index !== -1 ? args[index + 1] : undefined;
+  };
+
+  const budget = loadBudget();
+
+  // Check if user wants to set a config value
+  const maxTx = getArg("max-tx");
+  const maxDaily = getArg("max-daily");
+  const maxTotal = getArg("max-total");
+  const approvalAbove = getArg("approval-above");
+
+  let changed = false;
+  if (maxTx) { budget.config.maxTransactionUsd = parseFloat(maxTx); changed = true; }
+  if (maxDaily) { budget.config.maxDailyUsd = parseFloat(maxDaily); changed = true; }
+  if (maxTotal) { budget.config.maxTotalUsd = parseFloat(maxTotal); changed = true; }
+  if (approvalAbove) { budget.config.requireApprovalAboveUsd = parseFloat(approvalAbove); changed = true; }
+
+  if (changed) {
+    saveBudget(budget);
+    console.log("Budget updated!\n");
+  }
+
+  const summary = getBudgetSummary(budget);
+
+  console.log("Limits:");
+  console.log(`  Per-transaction:  $${summary.config.maxTransactionUsd.toFixed(2)}`);
+  console.log(`  Daily:            $${summary.config.maxDailyUsd.toFixed(2)}`);
+  console.log(`  Lifetime:         $${summary.config.maxTotalUsd.toFixed(2)}`);
+  console.log(`  Approval above:   $${summary.config.requireApprovalAboveUsd.toFixed(2)}`);
+  console.log("");
+  console.log("Usage:");
+  console.log(`  Spent today:      $${summary.dailySpent.toFixed(2)} / $${summary.config.maxDailyUsd.toFixed(2)}`);
+  console.log(`  Daily remaining:  $${summary.dailyRemaining.toFixed(2)}`);
+  console.log(`  Spent total:      $${summary.totalSpent.toFixed(2)} / $${summary.config.maxTotalUsd.toFixed(2)}`);
+  console.log(`  Total remaining:  $${summary.totalRemaining.toFixed(2)}`);
+  console.log("");
+
+  if (!changed) {
+    console.log("To update limits:");
+    console.log("  npx @agent-pay/mcp wallet budget --max-tx 100 --max-daily 200");
+  }
+}
+
+// ============================================================================
 // HELP COMMAND
 // ============================================================================
 
@@ -1393,9 +1711,10 @@ function showHelp() {
 Agent-Pay CLI - Trustless Compute Provisioning
 
 Commands:
-  wallet create              Create a new Akash wallet
+  wallet create              Create a new Akash wallet (+ Base EVM address)
   wallet list                List all stored wallets
-  wallet balance [address]   Check wallet balance
+  wallet balance [address]   Check wallet balance (Akash + Base)
+  wallet budget              View/configure spending limits
 
   deploy                     Deploy to Akash Network
     --cpu <n>                CPU cores (default: 1)
@@ -1418,11 +1737,20 @@ Commands:
   bridge                     Bridge USDC from Base to Akash (via Skip Go)
     --amount <usdc>          Amount to bridge (default: 10)
     --receive <token>        Token to receive: akt or usdc (default: akt)
+    --direct                 Sign with agent wallet (no WalletConnect QR)
+
+  wallet budget              View/configure autonomous spending limits
+    --max-tx <usd>           Max per-transaction (default: 50)
+    --max-daily <usd>        Max per-day (default: 100)
+    --max-total <usd>        Lifetime cap (default: 500)
+    --approval-above <usd>   Prompt user above this amount (default: 25)
 
 Examples:
   npx @agent-pay/mcp wallet create
   npx @agent-pay/mcp wallet balance
+  npx @agent-pay/mcp wallet budget
   npx @agent-pay/mcp bridge --amount 10
+  npx @agent-pay/mcp bridge --amount 5 --direct
   npx @agent-pay/mcp deploy --cpu 2 --memory 4Gi --image ubuntu:22.04 --port 22
   npx @agent-pay/mcp status 12345678
   npx @agent-pay/mcp close 12345678
@@ -1452,9 +1780,14 @@ if (command === "wallet") {
       console.error("Failed:", error);
       process.exit(1);
     });
+  } else if (subcommand === "budget") {
+    walletBudget().catch((error) => {
+      console.error("Failed:", error);
+      process.exit(1);
+    });
   } else {
     console.error(`Unknown wallet command: ${subcommand}`);
-    console.error("Available: wallet create, wallet list, wallet balance");
+    console.error("Available: wallet create, wallet list, wallet balance, wallet budget");
     process.exit(1);
   }
 } else if (command === "deploy") {

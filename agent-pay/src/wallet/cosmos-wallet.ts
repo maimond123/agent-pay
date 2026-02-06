@@ -7,9 +7,11 @@
 
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { Bip39, Random } from "@cosmjs/crypto";
+import { deriveEvmAccount } from "./evm-wallet.js";
 
 export interface WalletCreationResult {
   address: string;
+  evmAddress: string;
   mnemonic: string;
   pubkey: string;
 }
@@ -25,8 +27,12 @@ export async function createAkashWallet(): Promise<WalletCreationResult> {
 
   const [account] = await wallet.getAccounts();
 
+  // Derive EVM address from the same mnemonic
+  const { evmAddress } = deriveEvmAccount(wallet.mnemonic);
+
   return {
     address: account.address,
+    evmAddress,
     mnemonic: wallet.mnemonic,
     pubkey: Buffer.from(account.pubkey).toString("base64"),
   };
